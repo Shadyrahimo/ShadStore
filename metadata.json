@@ -1,6 +1,6 @@
 {
-  "name": "XPay Store",
-  "description": "XPay Store Telegram Mini App digital goods store and management backend.",
+  "name": "SRDev",
+  "description": "SRDev — Multi-tenant digital goods store platform with Telegram Mini App support and management backend.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
