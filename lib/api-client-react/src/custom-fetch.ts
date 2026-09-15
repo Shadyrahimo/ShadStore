@@ -17,7 +17,7 @@ const DEFAULT_JSON_ACCEPT = "application/json, application/problem+json";
 
 let _baseUrl: string | null = null;
 let _authTokenGetter: AuthTokenGetter | null = null;
-const TG_CACHE_KEY = "xpay_telegram_identity";
+const TG_CACHE_KEY = "srdev_telegram_identity";
 
 type TelegramIdentity = {
   id: string;
