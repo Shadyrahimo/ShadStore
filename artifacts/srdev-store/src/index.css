@@ -219,19 +219,19 @@
 
 /* Luxury Dark & Gold Custom Components */
 
-.xpay-shell {
+.srdev-shell {
   isolation: isolate;
   background-color: var(--bg-primary);
   color: var(--text-primary);
 }
 
-.xpay-app-frame {
+.srdev-app-frame {
   background-color: var(--bg-primary);
   border-inline: 1px solid var(--border-color);
   box-shadow: 0 20px 50px var(--shadow-color);
 }
 
-.xpay-brand-card {
+.srdev-brand-card {
   background: var(--bg-card);
   border: 1px solid var(--border-color);
   color: var(--text-primary);
@@ -435,7 +435,7 @@
   opacity: 0.15;
 }
 
-@keyframes xpay-news-marquee {
+@keyframes srdev-news-marquee {
   0% {
     transform: translateX(-10%);
   }
@@ -445,7 +445,7 @@
 }
 
 .news-marquee {
-  animation: xpay-news-marquee 18s linear infinite;
+  animation: srdev-news-marquee 18s linear infinite;
   will-change: transform;
 }
 
@@ -461,18 +461,18 @@
     background-color: var(--bg-primary);
   }
 
-  .xpay-shell {
+  .srdev-shell {
     background-color: var(--bg-primary);
   }
 
-  .xpay-app-frame {
+  .srdev-app-frame {
     max-width: none;
     border-inline: 0;
     box-shadow: none;
     background-color: var(--bg-primary);
   }
 
-  .xpay-shell nav {
+  .srdev-shell nav {
     background: var(--bg-primary);
     backdrop-filter: blur(12px);
     border-top: 1px solid var(--border-color);

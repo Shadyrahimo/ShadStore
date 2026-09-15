@@ -70,10 +70,10 @@ export function ensureGoogleFontsLoaded(arabicFont: string, englishFont: string)
       .join("&");
 
     const fontUrl = `https://fonts.googleapis.com/css2?${fontFamiliesQuery}&display=swap`;
-    let link = document.getElementById("xpay-store-google-fonts") as HTMLLinkElement | null;
+    let link = document.getElementById("srdev-store-google-fonts") as HTMLLinkElement | null;
     if (!link) {
       link = document.createElement("link");
-      link.id = "xpay-store-google-fonts";
+      link.id = "srdev-store-google-fonts";
       link.rel = "stylesheet";
       document.head.appendChild(link);
     }
@@ -152,8 +152,8 @@ export function setStoreThemeMode(mode: "dark" | "light") {
     // Ignore storage restrictions
   }
   applyStoreTheme(cachedThemeSettings);
-  window.dispatchEvent(new CustomEvent("xpay_theme_mode_changed", { detail: { mode } }));
-  window.dispatchEvent(new CustomEvent("xpay_theme_change", { detail: { mode } }));
+  window.dispatchEvent(new CustomEvent("srdev_theme_mode_changed", { detail: { mode } }));
+  window.dispatchEvent(new CustomEvent("srdev_theme_change", { detail: { mode } }));
 }
 
 /**
@@ -271,10 +271,10 @@ export function applyStoreTheme(theme?: Partial<StoreThemeSettings> | null | und
   root.style.setProperty("--app-font-sans", `'${fontArabic}', '${fontEnglish}', sans-serif`);
 
   // 3. Inject Comprehensive Dynamic Style Tag
-  let styleTag = document.getElementById("xpay-dynamic-store-theme") as HTMLStyleElement | null;
+  let styleTag = document.getElementById("srdev-dynamic-store-theme") as HTMLStyleElement | null;
   if (!styleTag) {
     styleTag = document.createElement("style");
-    styleTag.id = "xpay-dynamic-store-theme";
+    styleTag.id = "srdev-dynamic-store-theme";
     document.head.appendChild(styleTag);
   }
 
@@ -406,7 +406,7 @@ export function applyStoreTheme(theme?: Partial<StoreThemeSettings> | null | und
     .rounded-2xl,
     .rounded-xl,
     .card-luxury,
-    .xpay-brand-card {
+    .srdev-brand-card {
       border-radius: ${radiusPx} !important;
     }
 
@@ -415,7 +415,7 @@ export function applyStoreTheme(theme?: Partial<StoreThemeSettings> | null | und
     .shadow-xl,
     .shadow-lg,
     .card-luxury,
-    .xpay-brand-card {
+    .srdev-brand-card {
       box-shadow: ${shadowCss} !important;
     }
 
