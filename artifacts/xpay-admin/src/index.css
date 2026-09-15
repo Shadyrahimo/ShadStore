@@ -1,0 +1,275 @@
+@import "tailwindcss";
+
+:root {
+  --primary: #C8A45C;
+  --primary-dark: #B8954A;
+  --dark: #1A1A1A;
+  --accent: #FDE68A;
+  --background: #1A1A1A;
+  --card: #2D2D2D;
+  --text-dark: #FFFFFF;
+  --text-light: #F9FAFB;
+  --border: #3D3D3D;
+
+  --color-gold: #C8A45C;
+  --color-gold-dark: #B8954A;
+  --color-gold-light: #FDE68A;
+  --color-deep-dark: #1A1A1A;
+  --color-card-dark: #2D2D2D;
+
+  --font-family-arabic: "Cairo", sans-serif;
+  --font-family-english: "Inter", sans-serif;
+  --font-family-sans: "Cairo", "Inter", system-ui, -apple-system, sans-serif;
+}
+
+@theme {
+  --font-family-sans: "Cairo", "Inter", system-ui, -apple-system, sans-serif;
+  --font-family-arabic: "Cairo", sans-serif;
+  --font-family-english: "Inter", sans-serif;
+
+  --color-primary: #C8A45C;
+  --color-primary-dark: #B8954A;
+  --color-gold: #C8A45C;
+  --color-dark: #1A1A1A;
+  --color-card: #2D2D2D;
+
+  --color-brand-50: #2A2418;
+  --color-brand-100: #3E3520;
+  --color-brand-200: #5C4F2E;
+  --color-brand-300: #857242;
+  --color-brand-400: #A89052;
+  --color-brand-500: #C8A45C;
+  --color-brand-600: #C8A45C;
+  --color-brand-700: #B8954A;
+  --color-brand-800: #967537;
+  --color-brand-900: #755928;
+  --color-accent-500: #C8A45C;
+  --color-accent-600: #B8954A;
+}
+
+* {
+  font-family: "Cairo", "Inter", system-ui, sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: #1A1A1A;
+  color: #FFFFFF;
+  direction: rtl;
+  font-family: "Cairo", "Inter", sans-serif;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #374151;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #C8A45C;
+}
+
+input,
+select,
+textarea,
+button {
+  font-family: "Cairo", "Inter", system-ui, sans-serif;
+}
+
+input,
+select,
+textarea {
+  border-color: #4B5563;
+  background-color: #3D3D3D;
+  color: #FFFFFF;
+  transition: all 0.2s ease-in-out;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: #C8A45C !important;
+  box-shadow: 0 0 0 3px rgba(200, 164, 92, 0.25) !important;
+}
+
+.btn-primary, button.bg-brand-600 {
+  background-color: #C8A45C !important;
+  color: #1A1A1A !important;
+  font-weight: 700;
+  transition: all 0.2s ease-in-out;
+}
+
+.btn-primary:hover, button.bg-brand-600:hover {
+  background-color: #B8954A !important;
+}
+
+.vip-badge, .badge-vip {
+  background: linear-gradient(135deg, #FDE68A 0%, #C8A45C 100%);
+  color: #1A1A1A;
+  font-weight: 700;
+  box-shadow: 0 0 12px rgba(200, 164, 92, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+}
+
+/* Base dark and gold overrides */
+.bg-white {
+  background-color: #2D2D2D !important;
+  color: #FFFFFF;
+}
+
+.bg-slate-50,
+.bg-slate-100 {
+  background-color: #242424 !important;
+}
+
+.bg-slate-200 {
+  background-color: #333333 !important;
+}
+
+.border-slate-100,
+.border-slate-200,
+.border-slate-300,
+.border-gray-200,
+.border-gray-300 {
+  border-color: rgba(200, 164, 92, 0.25) !important;
+}
+
+.text-slate-900,
+.text-slate-800,
+.text-gray-900,
+.text-gray-800 {
+  color: #FFFFFF !important;
+}
+
+.text-slate-700,
+.text-slate-600,
+.text-gray-700,
+.text-gray-600 {
+  color: #E5E7EB !important;
+}
+
+.text-slate-500,
+.text-slate-400,
+.text-gray-500,
+.text-gray-400 {
+  color: #9CA3AF !important;
+}
+
+table thead,
+.bg-slate-100 table thead,
+.bg-slate-50 table thead {
+  background-color: #202020 !important;
+  color: #FDE68A !important;
+}
+
+tr:hover,
+.hover\:bg-slate-50:hover,
+.hover\:bg-slate-100:hover {
+  background-color: #363636 !important;
+}
+
+.shadow-sm,
+.shadow-md,
+.shadow-lg,
+.shadow-xl,
+.shadow-2xl {
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4) !important;
+}
+
+/* Admin panel dark mode. Scoped to xpay-admin only via html.admin-dark. */
+html.admin-dark body {
+  background-color: #121212;
+  color: #F9FAFB;
+}
+
+html.admin-dark .bg-slate-100,
+html.admin-dark .bg-slate-50 {
+  background-color: #181818 !important;
+}
+
+html.admin-dark .bg-white {
+  background-color: #202020 !important;
+}
+
+html.admin-dark .bg-card,
+html.admin-dark .bg-slate-200 {
+  background-color: #262626 !important;
+}
+
+html.admin-dark .text-slate-900,
+html.admin-dark .text-slate-800,
+html.admin-dark .text-slate-700,
+html.admin-dark .text-slate-600 {
+  color: #F9FAFB !important;
+}
+
+html.admin-dark .text-slate-500,
+html.admin-dark .text-slate-400 {
+  color: #9CA3AF !important;
+}
+
+html.admin-dark .border-slate-200,
+html.admin-dark .border-slate-100,
+html.admin-dark .border-slate-300 {
+  border-color: #374151 !important;
+}
+
+html.admin-dark input,
+html.admin-dark select,
+html.admin-dark textarea {
+  background-color: #181818 !important;
+  color: #F9FAFB !important;
+  border-color: #374151 !important;
+}
+
+html.admin-dark input::placeholder,
+html.admin-dark textarea::placeholder {
+  color: #6B7280 !important;
+}
+
+html.admin-dark table thead,
+html.admin-dark .bg-slate-100 table thead,
+html.admin-dark .bg-slate-50 table thead {
+  background-color: #262626 !important;
+}
+
+html.admin-dark tr:hover,
+html.admin-dark .hover\:bg-slate-50:hover,
+html.admin-dark .hover\:bg-slate-100:hover {
+  background-color: #2A2A2A !important;
+}
+
+html.admin-dark .shadow-sm,
+html.admin-dark .shadow-xl,
+html.admin-dark .shadow-lg {
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4) !important;
+}
+
+html.admin-dark .bg-rose-50 {
+  background-color: rgba(127, 29, 29, 0.3) !important;
+}
+
+html.admin-dark .bg-emerald-50 {
+  background-color: rgba(6, 78, 59, 0.35) !important;
+}
+
+html.admin-dark .bg-brand-600 {
+  background-color: #C8A45C !important;
+}
+
+html.admin-dark ::-webkit-scrollbar-thumb {
+  background: #374151;
+}
+
+html.admin-dark ::-webkit-scrollbar-thumb:hover {
+  background: #C8A45C;
+}

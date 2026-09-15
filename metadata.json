@@ -1,0 +1,6 @@
+{
+  "name": "XPay Store",
+  "description": "XPay Store Telegram Mini App digital goods store and management backend.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

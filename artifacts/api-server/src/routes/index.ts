@@ -1,0 +1,30 @@
+import { Router, type IRouter } from "express";
+import healthRouter from "./health.js";
+import authRouter from "./auth.js";
+import profileRouter from "./profile.js";
+import catalogRouter from "./catalog.js";
+import favoritesRouter from "./favorites.js";
+import metaRouter from "./meta.js";
+import ordersRouter from "./orders.js";
+import depositsRouter from "./deposits.js";
+import notificationsRouter from "./notifications.js";
+import telegramAdminRouter from "./telegram-admin.js";
+import telegramStoreRouter from "./telegram-store.js";
+import adminRouter from "./admin.js";
+
+const router: IRouter = Router();
+
+router.use(healthRouter);
+router.use(authRouter);
+router.use(profileRouter);
+router.use(catalogRouter);
+router.use(favoritesRouter);
+router.use(metaRouter);
+router.use(ordersRouter);
+router.use(depositsRouter);
+router.use(notificationsRouter);
+router.use(telegramAdminRouter);
+router.use(telegramStoreRouter);
+router.use(adminRouter);
+
+export default router;

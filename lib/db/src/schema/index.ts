@@ -1,0 +1,359 @@
+import {
+  pgTable,
+  pgEnum,
+  text,
+  serial,
+  integer,
+  boolean,
+  numeric,
+  timestamp,
+  jsonb,
+  unique,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
+
+export const quantityTypeEnum = pgEnum("quantity_type", ["fixed", "range", "list"]);
+export const productChangeTypeEnum = pgEnum("product_change_type", ["profit", "max_quantity"]);
+
+export const usersTable = pgTable("users", {
+  id: serial("id").primaryKey(),
+  displayId: text("display_id").unique(),
+  telegramId: text("telegram_id").unique(),
+  username: text("username").notNull(),
+  email: text("email").unique(),
+  passwordHash: text("password_hash"),
+  avatarUrl: text("avatar_url"),
+  balanceUsd: numeric("balance_usd", { precision: 24, scale: 12 }).notNull().default("0"),
+  balanceSyp: numeric("balance_syp", { precision: 14, scale: 2 }).notNull().default("0"),
+  totalSpent: numeric("total_spent", { precision: 24, scale: 12 }).notNull().default("0"),
+  role: text("role").notNull().default("user"),
+  banned: boolean("banned").notNull().default(false),
+  vipLevel: integer("vip_level").notNull().default(1),
+  referralCode: text("referral_code"),
+  referredBy: integer("referred_by"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const userFavoritesTable = pgTable(
+  "user_favorites",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id").notNull().references(() => usersTable.id, { onDelete: "cascade" }),
+    productId: integer("product_id").notNull().references(() => productsTable.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => [
+    unique("unique_user_product_favorite").on(t.userId, t.productId),
+  ]
+);
+
+export const categoriesTable = pgTable("categories", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
+  image: text("image").notNull(),
+  order: integer("order").notNull().default(0),
+  active: boolean("active").notNull().default(true),
+  columnsCount: integer("columns_count").notNull().default(2),
+});
+
+export const productGroupsTable = pgTable("product_groups", {
+  id: serial("id").primaryKey(),
+  categoryId: integer("category_id").notNull().references(() => categoriesTable.id),
+  name: text("name").notNull(),
+  image: text("image").notNull(),
+  order: integer("order").notNull().default(0),
+  active: boolean("active").notNull().default(true),
+});
+
+export const productsTable = pgTable("products", {
+  id: serial("id").primaryKey(),
+  categoryId: integer("category_id").notNull().references(() => categoriesTable.id),
+  groupId: integer("group_id").references(() => productGroupsTable.id),
+  name: text("name").notNull(),
+  image: text("image").notNull(),
+  priceUsd: numeric("price_usd", { precision: 24, scale: 12 }).notNull(),
+  priceSyp: numeric("price_syp", { precision: 14, scale: 2 }).notNull(),
+  basePriceUsd: numeric("base_price_usd", { precision: 24, scale: 12 }),
+  providerUnitPrice: numeric("provider_unit_price", { precision: 16, scale: 8 }),
+  storeProfitPerUnit: numeric("store_profit_per_unit", { precision: 16, scale: 8 }).notNull().default("0"),
+  finalUnitPrice: numeric("final_unit_price", { precision: 16, scale: 8 }),
+  productType: text("product_type").notNull().default("package"),
+  available: boolean("available").notNull().default(true),
+  order: integer("order").notNull().default(0),
+  minQty: numeric("min_qty", { precision: 14, scale: 2 }),
+  maxQty: numeric("max_qty", { precision: 14, scale: 2 }),
+  minQuantity: integer("min_quantity"),
+  maxQuantity: integer("max_quantity"),
+  quantityType: quantityTypeEnum("quantity_type").notNull().default("fixed"),
+  quantityValues: jsonb("quantity_values"),
+  description: text("description"),
+  featured: boolean("featured").notNull().default(false),
+  providerId: integer("provider_id"),
+  source: text("source").notNull().default("manual"),
+  providerProductId: integer("provider_product_id"),
+});
+
+export const newsTable = pgTable("news", {
+  id: serial("id").primaryKey(),
+  content: text("content").notNull(),
+  type: text("type").notNull().default("general"),
+  active: boolean("active").notNull().default(true),
+});
+
+export const bannersTable = pgTable("banners", {
+  id: serial("id").primaryKey(),
+  image: text("image").notNull(),
+  title: text("title").notNull(),
+  description: text("description"),
+  link: text("link"),
+  order: integer("order").notNull().default(0),
+  active: boolean("active").notNull().default(true),
+  featured: boolean("featured").notNull().default(false),
+  showDiscoverBtn: boolean("show_discover_btn").notNull().default(false),
+  showAutoExecBtn: boolean("show_auto_exec_btn").notNull().default(false),
+  showReliableBtn: boolean("show_reliable_btn").notNull().default(false),
+  showFeaturedBtn: boolean("show_featured_btn").notNull().default(false),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const paymentMethodsTable = pgTable("payment_methods", {
+  id: serial("id").primaryKey(),
+  code: text("code").notNull().unique(),
+  name: text("name").notNull(),
+  subtitle: text("subtitle").notNull().default("normal"),
+  requiresVerification: boolean("requires_verification").notNull().default(false),
+  instructions: text("instructions"),
+  walletAddress: text("wallet_address"),
+  logoImage: text("logo_image"),
+  qrImage: text("qr_image"),
+  showQrFromAddress: boolean("show_qr_from_address").notNull().default(false),
+  minAmount: numeric("min_amount", { precision: 12, scale: 2 }).notNull().default("1"),
+  active: boolean("active").notNull().default(true),
+  order: integer("order").notNull().default(0),
+  category: text("category"),
+  displayConfig: jsonb("display_config"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export const socialLinksTable = pgTable("social_links", {
+  id: serial("id").primaryKey(),
+  platform: text("platform").notNull(),
+  url: text("url").notNull(),
+  label: text("label").notNull(),
+  order: integer("order").notNull().default(0),
+  active: boolean("active").notNull().default(true),
+  icon: text("icon"),
+});
+
+export const ordersTable = pgTable("orders", {
+  id: serial("id").primaryKey(),
+  orderNumber: text("order_number").notNull().unique(),
+  userId: integer("user_id").notNull().references(() => usersTable.id),
+  productId: integer("product_id").notNull().references(() => productsTable.id),
+  quantity: numeric("quantity", { precision: 14, scale: 2 }).notNull(),
+  userIdentifier: text("user_identifier"),
+  totalUsd: numeric("total_usd", { precision: 24, scale: 12 }).notNull(),
+  totalSyp: numeric("total_syp", { precision: 14, scale: 2 }).notNull(),
+  costUsd: numeric("cost_usd", { precision: 24, scale: 12 }).notNull().default("0"),
+  status: text("status").notNull().default("wait"),
+  meta: jsonb("meta"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const depositsTable = pgTable("deposits", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => usersTable.id),
+  amountUsd: numeric("amount_usd", { precision: 24, scale: 12 }).notNull(),
+  amountSyp: numeric("amount_syp", { precision: 14, scale: 2 }),
+  currency: text("currency").notNull(),
+  method: text("method").notNull(),
+  methodLabel: text("method_label").notNull(),
+  transactionId: text("transaction_id").notNull(),
+  proofImage: text("proof_image"),
+  telegramMessageId: integer("telegram_message_id"),
+  status: text("status").notNull().default("pending"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const shamcashUsedTransactionRefsTable = pgTable(
+  "shamcash_used_transaction_refs",
+  {
+    id: serial("id").primaryKey(),
+    transactionRef: text("transaction_ref").notNull(),
+    depositId: integer("deposit_id").references(() => depositsTable.id),
+    userId: integer("user_id").references(() => usersTable.id),
+    invoiceId: text("invoice_id"),
+    amountUsd: numeric("amount_usd", { precision: 24, scale: 12 }),
+    amountSyp: numeric("amount_syp", { precision: 14, scale: 2 }),
+    currency: text("currency"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_shamcash_used_refs_ref").on(table.transactionRef),
+  ],
+);
+
+export const adminsTable = pgTable("admins", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  password: text("password").notNull(),
+  fullName: text("full_name").notNull(),
+  email: text("email"),
+  role: text("role").notNull().default("admin"),
+  permissions: jsonb("permissions"),
+  twoFactorSecret: text("two_factor_secret"),
+  active: boolean("active").notNull().default(true),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const productChangesLogTable = pgTable("product_changes_log", {
+  id: serial("id").primaryKey(),
+  productId: integer("product_id").notNull().references(() => productsTable.id),
+  changeType: productChangeTypeEnum("change_type").notNull(),
+  oldValue: text("old_value"),
+  newValue: text("new_value"),
+  providerSnapshot: jsonb("provider_snapshot"),
+  adminId: integer("admin_id").references(() => adminsTable.id),
+  changedAt: timestamp("changed_at").defaultNow().notNull(),
+});
+
+export const settingsTable = pgTable("settings", {
+  key: text("key").primaryKey(),
+  value: jsonb("value").notNull(),
+});
+
+export const providersTable = pgTable("providers", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
+  apiUrl: text("api_url"),
+  apiKey: text("api_key"),
+  notes: text("notes"),
+  priority: integer("priority").notNull().default(0),
+  active: boolean("active").notNull().default(true),
+  providerType: text("provider_type").default("custom"),
+  productsEndpoint: text("products_endpoint"),
+  profileEndpoint: text("profile_endpoint"),
+  orderEndpoint: text("order_endpoint"),
+  checkEndpoint: text("check_endpoint"),
+  tokenHeader: text("token_header"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const couponsTable = pgTable("coupons", {
+  id: serial("id").primaryKey(),
+  code: text("code").notNull().unique(),
+  discountPct: numeric("discount_pct", { precision: 5, scale: 2 }).notNull(),
+  maxUses: integer("max_uses").notNull().default(100),
+  usedCount: integer("used_count").notNull().default(0),
+  active: boolean("active").notNull().default(true),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const vipMembershipsTable = pgTable("vip_memberships", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
+  nameAr: text("name_ar").notNull().default(""),
+  levelOrder: integer("level_order").notNull().default(1),
+  requiredAmount: numeric("required_amount", { precision: 12, scale: 2 }).notNull().default("0"),
+  discountPercent: numeric("discount_percent", { precision: 5, scale: 2 }).notNull().default("0"),
+  profitPct: numeric("profit_pct", { precision: 5, scale: 2 }),
+  badgeColor: text("badge_color").default("#C8A45C"),
+  badge: text("badge"),
+  benefits: jsonb("benefits").default([]),
+  description: text("description"),
+  hidden: boolean("hidden").notNull().default(false),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const autoCodesTable = pgTable("auto_codes", {
+  id: serial("id").primaryKey(),
+  productId: integer("product_id").notNull().references(() => productsTable.id),
+  code: text("code").notNull(),
+  note: text("note"),
+  used: boolean("used").notNull().default(false),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const orderMessagesTable = pgTable("order_messages", {
+  id: serial("id").primaryKey(),
+  event: text("event").notNull().unique(),
+  title: text("title").notNull(),
+  body: text("body").notNull(),
+});
+
+export const activityLogTable = pgTable("activity_log", {
+  id: serial("id").primaryKey(),
+  actorType: text("actor_type").notNull().default("admin"),
+  actorId: text("actor_id"),
+  actorName: text("actor_name"),
+  action: text("action").notNull(),
+  target: text("target"),
+  meta: jsonb("meta"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const apiKeysTable = pgTable("api_keys", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
+  keyValue: text("key_value").notNull().unique(),
+  active: boolean("active").notNull().default(true),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const notificationsTable = pgTable("notifications", {
+  id: serial("id").primaryKey(),
+  targetType: text("target_type").notNull().default("all"),
+  targetUserId: integer("target_user_id"),
+  title: text("title"),
+  content: text("content").notNull(),
+  status: text("status").notNull().default("sent"),
+  isRead: boolean("is_read").notNull().default(false),
+  readAt: timestamp("read_at"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const ticketsTable = pgTable("tickets", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").references(() => usersTable.id),
+  userName: text("user_name"),
+  userEmail: text("user_email"),
+  subject: text("subject").notNull(),
+  status: text("status").notNull().default("pending"), // pending, answered, closed
+  priority: text("priority").default("medium"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const ticketMessagesTable = pgTable("ticket_messages", {
+  id: serial("id").primaryKey(),
+  ticketId: integer("ticket_id").notNull(),
+  senderType: text("sender_type").notNull().default("user"), // user | admin
+  senderName: text("sender_name").notNull().default("user"),
+  message: text("message").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const productPageConfigTable = pgTable("product_page_config", {
+  id: serial("id").primaryKey(),
+  sections: jsonb("sections").notNull().default('[]'),
+  customization: jsonb("customization").notNull().default('{}'),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const identityVerificationsTable = pgTable("identity_verifications", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => usersTable.id, { onDelete: "cascade" }),
+  fullName: text("full_name").notNull(),
+  idFrontImage: text("id_front_image").notNull(),
+  idBackImage: text("id_back_image").notNull(),
+  selfieImage: text("selfie_image").notNull(),
+  status: text("status").notNull().default("pending"),
+  rejectionReason: text("rejection_reason"),
+  reviewedBy: integer("reviewed_by"),
+  reviewedAt: timestamp("reviewed_at"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+

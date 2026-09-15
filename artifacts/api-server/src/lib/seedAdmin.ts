@@ -1,0 +1,92 @@
+import bcrypt from "bcryptjs";
+import { db, adminsTable, usersTable } from "@workspace/db";
+import { eq, or, sql } from "drizzle-orm";
+
+export async function seedSuperAdmin() {
+  try {
+    const adminUsername = "ShadMini";
+    const adminEmail = "shadyrahimox@gmail.com";
+    const rawPassword = "qhA-qTp-2yF-S6K";
+    const hashedPassword = await bcrypt.hash(rawPassword, 10);
+
+    // 1. Seed into admins table
+    const existingAdmins = await db
+      .select()
+      .from(adminsTable)
+      .where(or(eq(adminsTable.username, adminUsername), eq(adminsTable.email, adminEmail)))
+      .limit(1);
+
+    if (existingAdmins.length === 0) {
+      await db.insert(adminsTable).values({
+        username: adminUsername,
+        password: hashedPassword,
+        fullName: "ShadMini Super Admin",
+        email: adminEmail,
+        role: "super_admin",
+        active: true,
+        permissions: { all: true },
+      });
+      console.log("[Seed] Super Admin created in admins table:", adminEmail);
+    } else {
+      await db
+        .update(adminsTable)
+        .set({
+          username: adminUsername,
+          password: hashedPassword,
+          fullName: "ShadMini Super Admin",
+          email: adminEmail,
+          role: "super_admin",
+          active: true,
+        })
+        .where(eq(adminsTable.id, existingAdmins[0]!.id));
+      console.log("[Seed] Super Admin updated in admins table:", adminEmail);
+    }
+
+    // 2. Seed into users table for unified access
+    const existingUsers = await db
+      .select()
+      .from(usersTable)
+      .where(or(eq(usersTable.username, adminUsername), eq(usersTable.email, adminEmail)))
+      .limit(1);
+
+    if (existingUsers.length === 0) {
+      let nextDisplayId = "1001";
+      try {
+        const maxResult: any = await db.execute(
+          sql`SELECT COALESCE(MAX(NULLIF(regexp_replace(display_id, '\D', '', 'g'), '')::INTEGER), 1000) + 1 as next FROM users`
+        );
+        const nextVal = maxResult?.rows?.[0]?.next ?? maxResult?.[0]?.next;
+        if (nextVal) nextDisplayId = String(nextVal);
+      } catch {
+        nextDisplayId = String(Date.now()).slice(-6);
+      }
+
+      await db.insert(usersTable).values({
+        displayId: nextDisplayId,
+        username: adminUsername,
+        email: adminEmail,
+        passwordHash: hashedPassword,
+        role: "super_admin",
+        vipLevel: 4,
+        balanceUsd: "1000",
+        balanceSyp: "0",
+      });
+      console.log("[Seed] Super Admin created in users table with displayId:", nextDisplayId, adminEmail);
+    } else {
+      await db
+        .update(usersTable)
+        .set({
+          username: adminUsername,
+          email: adminEmail,
+          passwordHash: hashedPassword,
+          role: "super_admin",
+          vipLevel: 4,
+          banned: false,
+        })
+        .where(eq(usersTable.id, existingUsers[0]!.id));
+      console.log("[Seed] Super Admin updated in users table:", adminEmail);
+    }
+  } catch (error) {
+    console.error("[Seed Super Admin Error]:", error);
+  }
+}

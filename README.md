@@ -1,1 +1,1 @@
-# ShadStore
+# ShadXMini

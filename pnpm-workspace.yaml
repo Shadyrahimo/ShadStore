@@ -1,0 +1,7 @@
+packages:
+  - 'packages/*'
+  - 'lib/*'
+  - 'artifacts/*'
+  - 'scripts'
+allowBuilds:
+  esbuild: true

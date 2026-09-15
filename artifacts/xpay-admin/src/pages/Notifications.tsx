@@ -1,0 +1,859 @@
+import { useEffect, useState, useMemo } from "react";
+import { get, post, put, del } from "../lib/api";
+import { 
+  Bell, 
+  Send, 
+  Trash2, 
+  ShoppingCart, 
+  Wallet, 
+  Users, 
+  Crown, 
+  Search, 
+  RefreshCw, 
+  CheckCircle2, 
+  AlertCircle,
+  Filter,
+  Sparkles,
+  Save,
+  Globe,
+  Image as ImageIcon
+} from "lucide-react";
+
+interface NotificationItem {
+  id: number;
+  targetType: string;
+  targetUserId: number | null;
+  targetUserName?: string | null;
+  targetUserEmail?: string | null;
+  targetDisplayId?: string | null;
+  title: string | null;
+  content: string;
+  status: string;
+  createdAt: string;
+}
+
+interface UserOption {
+  id: number;
+  username: string;
+  email?: string;
+  displayId?: string;
+}
+
+export default function Notifications() {
+  const [items, setItems] = useState<NotificationItem[]>([]);
+  const [users, setUsers] = useState<UserOption[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [title, setTitle] = useState("");
+  const [content, setContent] = useState("");
+  const [targetType, setTargetType] = useState("all");
+  const [targetUserId, setTargetUserId] = useState("");
+  const [userSearchQuery, setUserSearchQuery] = useState("");
+  const [filterType, setFilterType] = useState<string>("all");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [activeTab, setActiveTab] = useState<"notifications" | "popup">("notifications");
+  const [popupSettings, setPopupSettings] = useState({
+    popupEnabled: false,
+    popupTitle: "",
+    popupContent: "",
+    popupImage: "",
+    popupLinkUrl: "",
+    popupLinkText: "",
+    popupButtonCloseText: "إغلاق الكل",
+    popupButtonReadText: "قراءة الكل",
+    popupButtonViewText: "عرض الكل",
+    popupShowOnlyOnce: true,
+  });
+  const [popupSaving, setPopupSaving] = useState(false);
+  const [popupSuccess, setPopupSuccess] = useState<string | null>(null);
+  const [popupErr, setPopupErr] = useState<string | null>(null);
+
+  const loadNotifications = async () => {
+    setLoading(true);
+    try {
+      const data = await get("/admin/notifications");
+      setItems(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      console.error("Load notifications error:", e);
+      setErr(e.message || "فشل تحميل قائمة الإشعارات");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadUsers = async () => {
+    try {
+      const data = await get("/admin/users");
+      if (Array.isArray(data)) {
+        setUsers(
+          data.map((u: any) => ({
+            id: u.id,
+            username: u.username,
+            email: u.email,
+            displayId: u.displayId || String(u.id),
+          }))
+        );
+      }
+    } catch (e) {
+      console.error("Load users for notifications error:", e);
+    }
+  };
+
+  const loadPopupSettings = async () => {
+    try {
+      const data = await get("/admin/popup-settings");
+      if (data) {
+        setPopupSettings({
+          popupEnabled: Boolean(data.popupEnabled),
+          popupTitle: data.popupTitle || "",
+          popupContent: data.popupContent || "",
+          popupImage: data.popupImage || "",
+          popupLinkUrl: data.popupLinkUrl || "",
+          popupLinkText: data.popupLinkText || "",
+          popupButtonCloseText: data.popupButtonCloseText || "إغلاق الكل",
+          popupButtonReadText: data.popupButtonReadText || "قراءة الكل",
+          popupButtonViewText: data.popupButtonViewText || "عرض الكل",
+          popupShowOnlyOnce: data.popupShowOnlyOnce !== false,
+        });
+      }
+    } catch (e) {
+      console.error("Load popup settings error:", e);
+    }
+  };
+
+  useEffect(() => {
+    loadNotifications();
+    loadUsers();
+    loadPopupSettings();
+  }, []);
+
+  const savePopupSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPopupSaving(true);
+    setPopupErr(null);
+    setPopupSuccess(null);
+    try {
+      await put("/admin/popup-settings", popupSettings);
+      setPopupSuccess("تم حفظ إعدادات النافذة المنبثقة بنجاح!");
+      setTimeout(() => setPopupSuccess(null), 4000);
+    } catch (e: any) {
+      setPopupErr(e.message || "فشل حفظ إعدادات النافذة المنبثقة");
+    } finally {
+      setPopupSaving(false);
+    }
+  };
+
+  const send = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!content.trim()) {
+      setErr("يرجى كتابة محتوى الإشعار");
+      return;
+    }
+    if (targetType === "user" && !targetUserId) {
+      setErr("يرجى اختيار أو تحديد ID المستخدم المستهدف");
+      return;
+    }
+
+    setBusy(true);
+    setErr(null);
+    setSuccessMsg(null);
+
+    try {
+      await post("/admin/notifications", {
+        title: title.trim() || "إشعار من الإدارة",
+        content: content.trim(),
+        targetType,
+        targetUserId: targetType === "user" ? Number(targetUserId) : null,
+      });
+
+      setSuccessMsg("تم إرسال الإشعار وحفظه بنجاح!");
+      setTitle("");
+      setContent("");
+      setTargetUserId("");
+      setUserSearchQuery("");
+      await loadNotifications();
+      setTimeout(() => setSuccessMsg(null), 4000);
+    } catch (e: any) {
+      setErr(e.message || "فشل إرسال الإشعار");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (id: number) => {
+    if (!confirm("هل أنت متأكد من حذف هذا الإشعار نهائياً؟")) return;
+    try {
+      await del(`/admin/notifications/${id}`);
+      setItems((prev) => prev.filter((it) => it.id !== id));
+    } catch (e: any) {
+      alert(e.message || "فشل حذف الإشعار");
+    }
+  };
+
+  const applyTemplate = (tplTitle: string, tplContent: string) => {
+    setTitle(tplTitle);
+    setContent(tplContent);
+  };
+
+  // Filtered Items
+  const filteredItems = useMemo(() => {
+    return items.filter((n) => {
+      // Category filter
+      if (filterType === "orders") {
+        const text = `${n.title || ""} ${n.content}`.toLowerCase();
+        if (!text.includes("طلب") && !text.includes("order") && !text.includes("شراء")) return false;
+      } else if (filterType === "deposits") {
+        const text = `${n.title || ""} ${n.content}`.toLowerCase();
+        if (!text.includes("إيداع") && !text.includes("شحن") && !text.includes("deposit") && !text.includes("رصيد")) return false;
+      } else if (filterType === "vip") {
+        if (n.targetType !== "vip") return false;
+      } else if (filterType === "direct") {
+        if (n.targetType !== "user") return false;
+      }
+
+      // Search query
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase();
+        const fullText = `${n.title || ""} ${n.content} ${n.targetUserName || ""} ${n.targetUserEmail || ""} ${n.targetUserId || ""}`.toLowerCase();
+        if (!fullText.includes(q)) return false;
+      }
+
+      return true;
+    });
+  }, [items, filterType, searchQuery]);
+
+  // Quick stats
+  const stats = useMemo(() => {
+    let orderCount = 0;
+    let depositCount = 0;
+    let userCount = 0;
+    items.forEach((it) => {
+      const text = `${it.title || ""} ${it.content}`.toLowerCase();
+      if (text.includes("طلب") || text.includes("order")) orderCount++;
+      if (text.includes("إيداع") || text.includes("شحن") || text.includes("رصيد")) depositCount++;
+      if (it.targetType === "user") userCount++;
+    });
+    return {
+      total: items.length,
+      orders: orderCount,
+      deposits: depositCount,
+      users: userCount,
+    };
+  }, [items]);
+
+  const filteredUsers = useMemo(() => {
+    if (!userSearchQuery.trim()) return users.slice(0, 50);
+    const q = userSearchQuery.toLowerCase();
+    return users
+      .filter((u) => u.username.toLowerCase().includes(q) || (u.email && u.email.toLowerCase().includes(q)) || String(u.id).includes(q) || (u.displayId && u.displayId.includes(q)))
+      .slice(0, 50);
+  }, [users, userSearchQuery]);
+
+  const getItemIcon = (n: NotificationItem) => {
+    const text = `${n.title || ""} ${n.content}`.toLowerCase();
+    if (text.includes("طلب") || text.includes("order")) {
+      return <ShoppingCart size={18} className="text-blue-500" />;
+    }
+    if (text.includes("إيداع") || text.includes("شحن") || text.includes("رصيد") || text.includes("محفظتك")) {
+      return <Wallet size={18} className="text-emerald-500" />;
+    }
+    if (n.targetType === "vip" || text.includes("vip")) {
+      return <Crown size={18} className="text-amber-500" />;
+    }
+    return <Bell size={18} className="text-[#C8A45C]" />;
+  };
+
+  return (
+    <div className="space-y-6 pb-12">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2.5">
+            <div className="w-10 h-10 rounded-xl bg-[#C8A45C]/15 border border-[#C8A45C]/30 flex items-center justify-center text-[#C8A45C]">
+              <Bell size={22} />
+            </div>
+            <span>نظام الإشعارات والتنبيهات</span>
+          </h1>
+          <p className="text-sm text-slate-600 mt-1">
+            إدارة وتوليد الإشعارات الفورية للطلبات، عمليات الشحن والإيداع، ورسائل المستخدمين
+          </p>
+        </div>
+
+        <button
+          onClick={() => {
+            loadNotifications();
+            loadPopupSettings();
+          }}
+          disabled={loading}
+          className="flex items-center gap-2 px-4 py-2.5 bg-white border border-slate-300 rounded-xl font-semibold text-slate-700 hover:bg-slate-50 shadow-xs transition-all disabled:opacity-50"
+        >
+          <RefreshCw size={16} className={loading ? "animate-spin text-[#C8A45C]" : ""} />
+          <span>تحديث البيانات</span>
+        </button>
+      </div>
+
+      {/* Tabs Switcher */}
+      <div className="flex border-b border-slate-200">
+        <button
+          onClick={() => setActiveTab("notifications")}
+          className={`py-3 px-6 font-bold text-sm border-b-2 transition-all flex items-center gap-2 ${
+            activeTab === "notifications"
+              ? "border-[#C8A45C] text-[#C8A45C]"
+              : "border-transparent text-slate-500 hover:text-slate-700"
+          }`}
+        >
+          <Bell size={16} />
+          <span>سجل وتاريخ الإشعارات</span>
+        </button>
+        <button
+          onClick={() => setActiveTab("popup")}
+          className={`py-3 px-6 font-bold text-sm border-b-2 transition-all flex items-center gap-2 ${
+            activeTab === "popup"
+              ? "border-[#C8A45C] text-[#C8A45C]"
+              : "border-transparent text-slate-500 hover:text-slate-700"
+          }`}
+        >
+          <Sparkles size={16} />
+          <span>إعدادات النافذة المنبثقة (Pop-up)</span>
+        </button>
+      </div>
+
+      {activeTab === "popup" ? (
+        <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-xs max-w-3xl">
+          <div className="flex items-center gap-3 mb-6 pb-4 border-b border-slate-100">
+            <div className="w-12 h-12 rounded-2xl bg-[#C8A45C]/15 border border-[#C8A45C]/30 flex items-center justify-center text-[#C8A45C]">
+              <Sparkles size={24} />
+            </div>
+            <div>
+              <h2 className="text-xl font-bold text-slate-900">إعدادات النافذة المنبثقة (Popup Notification)</h2>
+              <p className="text-sm text-slate-500">التحكم في النافذة الترحيبية والتنبيهية التي تظهر للمستخدمين عند تسجيل الدخول أو زيارة المتجر.</p>
+            </div>
+          </div>
+
+          {popupSuccess && (
+            <div className="mb-6 p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm font-semibold flex items-center gap-2">
+              <CheckCircle2 size={18} className="text-emerald-600 shrink-0" />
+              <span>{popupSuccess}</span>
+            </div>
+          )}
+
+          {popupErr && (
+            <div className="mb-6 p-4 rounded-xl bg-red-50 border border-red-200 text-red-800 text-sm font-semibold flex items-center gap-2">
+              <AlertCircle size={18} className="text-red-600 shrink-0" />
+              <span>{popupErr}</span>
+            </div>
+          )}
+
+          <form onSubmit={savePopupSettings} className="space-y-5">
+            {/* Enable switch */}
+            <div className="flex items-center justify-between p-4 bg-slate-50 border border-slate-200 rounded-xl">
+              <div>
+                <span className="font-bold text-slate-900 block">تفعيل النافذة المنبثقة</span>
+                <span className="text-xs text-slate-500">إظهار النافذة للمستخدمين المسجلين عند الدخول</span>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={popupSettings.popupEnabled}
+                  onChange={(e) => setPopupSettings({ ...popupSettings, popupEnabled: e.target.checked })}
+                  className="sr-only peer"
+                />
+                <div className="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-[#C8A45C]"></div>
+              </label>
+            </div>
+
+            {/* Title */}
+            <div>
+              <label className="block text-sm font-bold text-slate-700 mb-1.5">عنوان النافذة</label>
+              <input
+                type="text"
+                value={popupSettings.popupTitle}
+                onChange={(e) => setPopupSettings({ ...popupSettings, popupTitle: e.target.value })}
+                placeholder="مثال: مجتمع الواتس أب"
+                className="w-full px-4 py-2.5 rounded-xl border border-slate-300 focus:outline-none focus:border-[#C8A45C] text-slate-900 text-sm"
+              />
+            </div>
+
+            {/* Content */}
+            <div>
+              <label className="block text-sm font-bold text-slate-700 mb-1.5">محتوى الرسالة</label>
+              <textarea
+                rows={4}
+                value={popupSettings.popupContent}
+                onChange={(e) => setPopupSettings({ ...popupSettings, popupContent: e.target.value })}
+                placeholder="تفاصيل التنبيه أو الإعلان..."
+                className="w-full px-4 py-2.5 rounded-xl border border-slate-300 focus:outline-none focus:border-[#C8A45C] text-slate-900 text-sm"
+              />
+            </div>
+
+            {/* Image URL */}
+            <div>
+              <label className="block text-sm font-bold text-slate-700 mb-1.5">رابط الصورة (اختياري)</label>
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <div className="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-slate-400">
+                    <ImageIcon size={18} />
+                  </div>
+                  <input
+                    type="url"
+                    value={popupSettings.popupImage}
+                    onChange={(e) => setPopupSettings({ ...popupSettings, popupImage: e.target.value })}
+                    placeholder="https://example.com/image.png"
+                    className="w-full pr-10 pl-4 py-2.5 rounded-xl border border-slate-300 focus:outline-none focus:border-[#C8A45C] text-slate-900 text-sm"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Link URL & Text */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-bold text-slate-700 mb-1.5">رابط الزر الخارجي (URL)</label>
+                <div className="relative">
+                  <div className="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-slate-400">
+                    <Globe size={18} />
+                  </div>
+                  <input
+                    type="url"
+                    value={popupSettings.popupLinkUrl}
+                    onChange={(e) => setPopupSettings({ ...popupSettings, popupLinkUrl: e.target.value })}
+                    placeholder="https://chat.whatsapp.com/..."
+                    className="w-full pr-10 pl-4 py-2.5 rounded-xl border border-slate-300 focus:outline-none focus:border-[#C8A45C] text-slate-900 text-sm"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-bold text-slate-700 mb-1.5">نص زر الرابط</label>
+                <input
+                  type="text"
+                  value={popupSettings.popupLinkText}
+                  onChange={(e) => setPopupSettings({ ...popupSettings, popupLinkText: e.target.value })}
+                  placeholder="مثال: انضم الآن"
+                  className="w-full px-4 py-2.5 rounded-xl border border-slate-300 focus:outline-none focus:border-[#C8A45C] text-slate-900 text-sm"
+                />
+              </div>
+            </div>
+
+            {/* Button Texts */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2 border-t border-slate-100">
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">نص زر الإغلاق</label>
+                <input
+                  type="text"
+                  value={popupSettings.popupButtonCloseText}
+                  onChange={(e) => setPopupSettings({ ...popupSettings, popupButtonCloseText: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">نص زر القراءة</label>
+                <input
+                  type="text"
+                  value={popupSettings.popupButtonReadText}
+                  onChange={(e) => setPopupSettings({ ...popupSettings, popupButtonReadText: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">نص زر العرض</label>
+                <input
+                  type="text"
+                  value={popupSettings.popupButtonViewText}
+                  onChange={(e) => setPopupSettings({ ...popupSettings, popupButtonViewText: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
+                />
+              </div>
+            </div>
+
+            {/* Show only once toggle */}
+            <div className="flex items-center justify-between p-4 bg-slate-50 border border-slate-200 rounded-xl">
+              <div>
+                <span className="font-bold text-slate-900 block">إظهار مرة واحدة فقط لكل مستخدم</span>
+                <span className="text-xs text-slate-500">عدم إظهار النافذة مرة أخرى إذا قام المستخدم بإغلاقها</span>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={popupSettings.popupShowOnlyOnce}
+                  onChange={(e) => setPopupSettings({ ...popupSettings, popupShowOnlyOnce: e.target.checked })}
+                  className="sr-only peer"
+                />
+                <div className="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-[#C8A45C]"></div>
+              </label>
+            </div>
+
+            <div className="pt-4 flex justify-end">
+              <button
+                type="submit"
+                disabled={popupSaving}
+                className="flex items-center gap-2 px-6 py-3 bg-[#C8A45C] hover:bg-[#B8954A] text-white font-bold rounded-xl shadow-md transition-all disabled:opacity-50"
+              >
+                <Save size={18} />
+                <span>{popupSaving ? "جاري الحفظ..." : "حفظ إعدادات النافذة المنبثقة"}</span>
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : (
+        <>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3.5">
+        <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs">
+          <div className="flex items-center justify-between text-slate-500 text-xs font-semibold">
+            <span>إجمالي الإشعارات</span>
+            <Bell size={16} className="text-[#C8A45C]" />
+          </div>
+          <div className="text-2xl font-bold text-slate-900 mt-2">{stats.total}</div>
+          <div className="text-xs text-slate-400 mt-0.5">مسجلة في قاعدة البيانات</div>
+        </div>
+
+        <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs">
+          <div className="flex items-center justify-between text-slate-500 text-xs font-semibold">
+            <span>تنبيهات الطلبات</span>
+            <ShoppingCart size={16} className="text-blue-500" />
+          </div>
+          <div className="text-2xl font-bold text-slate-900 mt-2">{stats.orders}</div>
+          <div className="text-xs text-slate-400 mt-0.5">قبول ورفض وتنفيذ</div>
+        </div>
+
+        <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs">
+          <div className="flex items-center justify-between text-slate-500 text-xs font-semibold">
+            <span>تنبيهات الإيداعات</span>
+            <Wallet size={16} className="text-emerald-500" />
+          </div>
+          <div className="text-2xl font-bold text-slate-900 mt-2">{stats.deposits}</div>
+          <div className="text-xs text-slate-400 mt-0.5">شحن وموافقة ورفض</div>
+        </div>
+
+        <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs">
+          <div className="flex items-center justify-between text-slate-500 text-xs font-semibold">
+            <span>رسائل مخصصة لمستخدم</span>
+            <Users size={16} className="text-purple-500" />
+          </div>
+          <div className="text-2xl font-bold text-slate-900 mt-2">{stats.users}</div>
+          <div className="text-xs text-slate-400 mt-0.5">إشعارات داخلية فردية</div>
+        </div>
+      </div>
+
+      {/* Send Notification Form */}
+      <div className="bg-white rounded-2xl shadow-xs border border-slate-200 overflow-hidden">
+        <div className="bg-gradient-to-r from-slate-900 to-slate-800 p-5 text-white flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-[#C8A45C]/20 border border-[#C8A45C]/40 flex items-center justify-center text-[#C8A45C]">
+              <Send size={16} />
+            </div>
+            <div>
+              <h2 className="font-bold text-base text-white">إرسال إشعار داخلي جديد</h2>
+              <p className="text-xs text-slate-300">يظهر الإشعار فوراً في حساب المستخدم داخل النظام</p>
+            </div>
+          </div>
+          <div className="hidden sm:flex items-center gap-1.5 text-xs text-[#C8A45C] bg-[#C8A45C]/10 border border-[#C8A45C]/30 px-3 py-1.5 rounded-lg">
+            <Sparkles size={14} />
+            <span>نظام الإرسال المباشر</span>
+          </div>
+        </div>
+
+        <form onSubmit={send} className="p-5 md:p-6 space-y-4">
+          {/* Quick Templates */}
+          <div>
+            <label className="block text-xs font-bold text-slate-600 mb-2">قوالب سريعة جاهزة:</label>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => applyTemplate("🎉 تم شحن رصيد حسابك بنجاح", "تمت إضافة الرصيد إلى محفظتك بنجاح، يمكنك الآن متابعة عمليات الشراء في المتجر.")}
+                className="text-xs bg-slate-100 hover:bg-[#C8A45C]/15 hover:text-[#C8A45C] hover:border-[#C8A45C]/40 text-slate-700 px-3 py-1.5 rounded-lg border border-slate-200 transition-all"
+              >
+                + شحن رصيد
+              </button>
+              <button
+                type="button"
+                onClick={() => applyTemplate("✅ تم تنفيذ طلبك بنجاح", "تمت معالجة وتنفيذ طلبك وتسليم البيانات المطلوبة بنجاح. شكراً لتعاملك معنا.")}
+                className="text-xs bg-slate-100 hover:bg-[#C8A45C]/15 hover:text-[#C8A45C] hover:border-[#C8A45C]/40 text-slate-700 px-3 py-1.5 rounded-lg border border-slate-200 transition-all"
+              >
+                + تنفيذ طلب
+              </button>
+              <button
+                type="button"
+                onClick={() => applyTemplate("⚠️ تنبيه هام من الإدارة", "يرجى التحقق من تفاصيل حسابك أو التواصل مع الدعم الفني للاستفسار.")}
+                className="text-xs bg-slate-100 hover:bg-[#C8A45C]/15 hover:text-[#C8A45C] hover:border-[#C8A45C]/40 text-slate-700 px-3 py-1.5 rounded-lg border border-slate-200 transition-all"
+              >
+                + تنبيه إداري
+              </button>
+              <button
+                type="button"
+                onClick={() => applyTemplate("⭐ ترقية إلى عضوية VIP", "تهانينا! تم ترقية حسابك إلى باقة VIP للاستفادة من خصومات وأسعار خاصة.")}
+                className="text-xs bg-slate-100 hover:bg-[#C8A45C]/15 hover:text-[#C8A45C] hover:border-[#C8A45C]/40 text-slate-700 px-3 py-1.5 rounded-lg border border-slate-200 transition-all"
+              >
+                + ترقية VIP
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Target Type */}
+            <div>
+              <label className="block text-sm font-semibold text-slate-700 mb-1.5">فئة المستهدفين</label>
+              <select
+                value={targetType}
+                onChange={(e) => setTargetType(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm font-medium text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#C8A45C]/30 focus:border-[#C8A45C]"
+              >
+                <option value="all">📢 جميع المستخدمين (إشعار عام)</option>
+                <option value="user">👤 مستخدم محدد (فردي)</option>
+                <option value="vip">⭐ عملاء VIP فقط</option>
+              </select>
+            </div>
+
+            {/* If Specific User */}
+            {targetType === "user" && (
+              <div className="md:col-span-2">
+                <label className="block text-sm font-semibold text-slate-700 mb-1.5">اختر المستخدم المستهدف</label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div>
+                    <input
+                      type="text"
+                      placeholder="بحث بالاسم أو البريد..."
+                      value={userSearchQuery}
+                      onChange={(e) => setUserSearchQuery(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#C8A45C]/30 focus:border-[#C8A45C]"
+                    />
+                  </div>
+                  <div>
+                    <select
+                      value={targetUserId}
+                      onChange={(e) => setTargetUserId(e.target.value)}
+                      required
+                      className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-medium text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#C8A45C]/30 focus:border-[#C8A45C]"
+                    >
+                      <option value="">-- اختر المستخدم ({filteredUsers.length}) --</option>
+                      {filteredUsers.map((u) => (
+                        <option key={u.id} value={u.id}>
+                          #{u.id} - {u.username} {u.email ? `(${u.email})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Title */}
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-1.5">عنوان الإشعار</label>
+            <input
+              type="text"
+              placeholder="مثال: تم شحن حسابك، أو تنبيه هام بخصوص طلبك"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#C8A45C]/30 focus:border-[#C8A45C]"
+            />
+          </div>
+
+          {/* Content */}
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-1.5">
+              محتوى الإشعار <span className="text-rose-500">*</span>
+            </label>
+            <textarea
+              placeholder="اكتب نص الإشعار هنا بشكل واضح ومحدد..."
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              rows={3}
+              required
+              className="w-full bg-slate-50 border border-slate-300 rounded-xl p-3 text-sm text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#C8A45C]/30 focus:border-[#C8A45C]"
+            />
+          </div>
+
+          {/* Alerts */}
+          {err && (
+            <div className="p-3.5 bg-rose-50 border border-rose-200 text-rose-700 rounded-xl text-sm flex items-center gap-2">
+              <AlertCircle size={18} className="shrink-0" />
+              <span>{err}</span>
+            </div>
+          )}
+
+          {successMsg && (
+            <div className="p-3.5 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-xl text-sm flex items-center gap-2">
+              <CheckCircle2 size={18} className="shrink-0" />
+              <span>{successMsg}</span>
+            </div>
+          )}
+
+          <div className="flex justify-end pt-1">
+            <button
+              type="submit"
+              disabled={busy}
+              className="flex items-center gap-2 px-6 py-2.5 bg-[#C8A45C] hover:bg-[#b5924b] text-slate-900 font-bold rounded-xl shadow-md shadow-[#C8A45C]/20 transition-all disabled:opacity-50"
+            >
+              <Send size={16} />
+              <span>{busy ? "جاري الإرسال..." : "إرسال الإشعار الآن"}</span>
+            </button>
+          </div>
+        </form>
+      </div>
+
+      {/* Notifications List Section */}
+      <div className="bg-white rounded-2xl shadow-xs border border-slate-200 overflow-hidden">
+        <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-slate-100 flex items-center justify-center text-slate-700">
+              <Filter size={16} />
+            </div>
+            <div>
+              <h2 className="font-bold text-slate-900 text-base">سجل الإشعارات والتنبيهات</h2>
+              <p className="text-xs text-slate-500">عرض وتصفية جميع الإشعارات الصادرة في النظام</p>
+            </div>
+          </div>
+
+          {/* Search */}
+          <div className="relative min-w-[240px]">
+            <Search size={16} className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              type="text"
+              placeholder="بحث في الإشعارات..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full bg-slate-50 border border-slate-200 rounded-xl pr-9 pl-3 py-2 text-sm text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#C8A45C]/30 focus:border-[#C8A45C]"
+            />
+          </div>
+        </div>
+
+        {/* Filter Tabs */}
+        <div className="flex items-center gap-1.5 p-3 bg-slate-50 border-b border-slate-200 overflow-x-auto">
+          <button
+            onClick={() => setFilterType("all")}
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shrink-0 ${
+              filterType === "all"
+                ? "bg-[#C8A45C] text-slate-900 shadow-xs"
+                : "text-slate-600 hover:bg-slate-200"
+            }`}
+          >
+            الكل ({items.length})
+          </button>
+          <button
+            onClick={() => setFilterType("orders")}
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 ${
+              filterType === "orders"
+                ? "bg-[#C8A45C] text-slate-900 shadow-xs"
+                : "text-slate-600 hover:bg-slate-200"
+            }`}
+          >
+            <ShoppingCart size={13} />
+            <span>الطلبات ({stats.orders})</span>
+          </button>
+          <button
+            onClick={() => setFilterType("deposits")}
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 ${
+              filterType === "deposits"
+                ? "bg-[#C8A45C] text-slate-900 shadow-xs"
+                : "text-slate-600 hover:bg-slate-200"
+            }`}
+          >
+            <Wallet size={13} />
+            <span>الإيداعات ({stats.deposits})</span>
+          </button>
+          <button
+            onClick={() => setFilterType("direct")}
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 ${
+              filterType === "direct"
+                ? "bg-[#C8A45C] text-slate-900 shadow-xs"
+                : "text-slate-600 hover:bg-slate-200"
+            }`}
+          >
+            <Users size={13} />
+            <span>رسائل فردية ({stats.users})</span>
+          </button>
+          <button
+            onClick={() => setFilterType("vip")}
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 ${
+              filterType === "vip"
+                ? "bg-[#C8A45C] text-slate-900 shadow-xs"
+                : "text-slate-600 hover:bg-slate-200"
+            }`}
+          >
+            <Crown size={13} />
+            <span>عملاء VIP</span>
+          </button>
+        </div>
+
+        {/* Notifications Items */}
+        <div className="divide-y divide-slate-100">
+          {filteredItems.length === 0 ? (
+            <div className="p-12 text-center">
+              <div className="w-12 h-12 rounded-full bg-slate-100 text-slate-400 mx-auto flex items-center justify-center mb-3">
+                <Bell size={22} />
+              </div>
+              <div className="text-slate-700 font-bold text-sm">لا توجد إشعارات مطابقة</div>
+              <p className="text-slate-400 text-xs mt-1">
+                {items.length === 0 ? "لم يتم إرسال أو تسجيل أي إشعار حتى الآن" : "جرب تغيير خيارات البحث أو التصفية"}
+              </p>
+            </div>
+          ) : (
+            filteredItems.map((n) => (
+              <div
+                key={n.id}
+                className="p-4 sm:p-5 flex items-start gap-3.5 hover:bg-slate-50/80 transition-all group"
+              >
+                {/* Icon */}
+                <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200/80 flex items-center justify-center shrink-0 shadow-2xs group-hover:scale-105 transition-transform">
+                  {getItemIcon(n)}
+                </div>
+
+                {/* Content */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2 mb-1">
+                    {n.title && (
+                      <span className="font-bold text-slate-900 text-sm">{n.title}</span>
+                    )}
+
+                    {/* Target Badge */}
+                    {n.targetType === "all" ? (
+                      <span className="inline-flex items-center gap-1 bg-purple-50 text-purple-700 border border-purple-200 text-xs font-semibold px-2.5 py-0.5 rounded-full">
+                        📢 جميع المستخدمين
+                      </span>
+                    ) : n.targetType === "vip" ? (
+                      <span className="inline-flex items-center gap-1 bg-amber-50 text-amber-700 border border-amber-200 text-xs font-semibold px-2.5 py-0.5 rounded-full">
+                        ⭐ عملاء VIP
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 bg-blue-50 text-blue-700 border border-blue-200 text-xs font-semibold px-2.5 py-0.5 rounded-full">
+                        👤 {n.targetUserName || `مستخدم #${n.targetUserId}`}
+                        {n.targetDisplayId ? ` (${n.targetDisplayId})` : ""}
+                      </span>
+                    )}
+
+                    <span className="text-xs text-slate-400 mr-auto">
+                      {new Date(n.createdAt).toLocaleDateString("ar-EG", {
+                        year: "numeric",
+                        month: "short",
+                        day: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </span>
+                  </div>
+
+                  <p className="text-sm text-slate-700 leading-relaxed break-words">{n.content}</p>
+                </div>
+
+                {/* Actions */}
+                <button
+                  onClick={() => remove(n.id)}
+                  className="text-slate-400 hover:text-rose-600 p-2 rounded-lg hover:bg-rose-50 transition-colors shrink-0"
+                  title="حذف الإشعار"
+                >
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+      </>
+      )}
+    </div>
+  );
+}

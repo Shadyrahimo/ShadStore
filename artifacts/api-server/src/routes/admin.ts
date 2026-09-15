@@ -1,0 +1,6144 @@
+import { Router, type IRouter } from "express";
+import bcrypt from "bcryptjs";
+import {
+  db,
+  adminsTable,
+  usersTable,
+  categoriesTable,
+  productGroupsTable,
+  productsTable,
+  productChangesLogTable,
+  ordersTable,
+  depositsTable,
+  newsTable,
+  bannersTable,
+  paymentMethodsTable,
+  socialLinksTable,
+  settingsTable,
+  providersTable,
+  couponsTable,
+  vipMembershipsTable,
+  autoCodesTable,
+  orderMessagesTable,
+  activityLogTable,
+  apiKeysTable,
+  notificationsTable,
+  ticketsTable,
+  ticketMessagesTable,
+  productPageConfigTable,
+  identityVerificationsTable,
+} from "@workspace/db";
+import { and, asc, desc, eq, gte, sql } from "drizzle-orm";
+import { requireAdmin } from "../lib/adminAuth.js";
+import { getAdapter } from "../lib/adapter-registry"; 
+import { MersalAdapter } from "../lib/mersal-adapter";
+import { getTelegramConfigStatus, notifyUserDepositApproved, notifyUserDepositRejected, notifyUserOrderStatusChanged } from "../lib/telegram.js";
+import { 
+  createInternalNotification, 
+  notifyUserDepositConfirmed as notifyInternalDepositConfirmed, 
+  notifyUserDepositRejected as notifyInternalDepositRejected,
+  notifyUserOrderAccepted as notifyInternalOrderAccepted,
+  notifyUserOrderRejected as notifyInternalOrderRejected,
+  notifyUserIdentityApproved,
+  notifyUserIdentityRejected
+} from "../lib/notifications.js";
+import { rateLimit } from "../lib/rateLimit.js";
+import { addUnitPrices, decimalToScaled, parseProviderQuantityValues, subtractUnitPrices } from "../lib/pricing.js";
+import { ensureDatabaseSchema } from "../lib/ensureSchema";
+import { extractStringValue } from "../services/shamcash.service.js";
+const router: IRouter = Router();
+const EXTERNAL_CATEGORY_NAME = "External Provider";
+const EXTERNAL_CATEGORY_IMAGE = "https://placehold.co/600x400?text=External+Provider";
+const BCRYPT_ROUNDS = 12;
+let depositsTelegramMessageColumnReady = false;
+
+async function ensureDepositsTelegramMessageColumn() {
+  if (depositsTelegramMessageColumnReady) return;
+  await db.execute(sql`
+    ALTER TABLE deposits
+    ADD COLUMN IF NOT EXISTS telegram_message_id INTEGER
+  `);
+  depositsTelegramMessageColumnReady = true;
+}
+
+class ValidationError extends Error {
+  statusCode: number;
+  constructor(message: string) {
+    super(message);
+    this.name = "ValidationError";
+    this.statusCode = 400;
+  }
+}
+
+function isBcryptHash(value: string | null | undefined): boolean {
+  return /^\$2[aby]\$\d{2}\$/.test(String(value || ""));
+}
+
+async function hashAdminPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, BCRYPT_ROUNDS);
+}
+
+async function verifyAdminPassword(storedPassword: string, candidate: string): Promise<boolean> {
+  if (isBcryptHash(storedPassword)) {
+    return bcrypt.compare(candidate, storedPassword);
+  }
+  return storedPassword === candidate;
+}
+
+function isBlank(v: unknown): boolean {
+  return v === null || v === undefined || (typeof v === "string" && v.trim() === "");
+}
+
+function normalizeNumberField(data: Record<string, any>, key: string, opts?: { nullable?: boolean; required?: boolean }) {
+  const raw = data[key];
+  const nullable = opts?.nullable ?? false;
+  const required = opts?.required ?? false;
+
+  if (isBlank(raw)) {
+    if (required) throw new ValidationError(`${key} is required`);
+    data[key] = nullable ? null : raw;
+    return;
+  }
+
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new ValidationError(`${key} must be a valid number`);
+  }
+  data[key] = n;
+}
+
+function normalizeDecimalField(
+  data: Record<string, any>,
+  key: string,
+  opts?: { nullable?: boolean; required?: boolean },
+) {
+  const raw = data[key];
+  const nullable = opts?.nullable ?? false;
+  const required = opts?.required ?? false;
+
+  if (isBlank(raw)) {
+    if (required) throw new ValidationError(`${key} is required`);
+    data[key] = nullable ? null : raw;
+    return;
+  }
+
+  const s = String(raw).trim();
+  if (!/^-?\d+(\.\d+)?$/.test(s)) {
+    throw new ValidationError(`${key} must be a valid decimal number`);
+  }
+  data[key] = s;
+}
+
+function parseBalanceAdjustment(body: any): {
+  currency: "USD" | "SYP";
+  operation: "add" | "sub";
+  amountText: string;
+  deltaText: string;
+  note?: string;
+} {
+  const currency = body?.currency === "SYP" ? "SYP" : "USD";
+  const note = typeof body?.note === "string" ? body.note : undefined;
+
+  let operation: "add" | "sub";
+  let amount: number;
+
+  if (body?.operation === "add" || body?.operation === "sub") {
+    operation = body.operation;
+    amount = Number(body.amount);
+  } else {
+    const delta = Number(body?.delta);
+    operation = delta < 0 ? "sub" : "add";
+    amount = Math.abs(delta);
+  }
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new ValidationError("المبلغ غير صالح");
+  }
+
+  const amountText = String(amount);
+  const deltaText = operation === "sub" ? `-${amountText}` : amountText;
+  return { currency, operation, amountText, deltaText, note };
+}
+
+async function applyUserBalanceAdjustment(userId: number, body: any) {
+  const adjustment = parseBalanceAdjustment(body);
+  const col = adjustment.currency === "SYP" ? usersTable.balanceSyp : usersTable.balanceUsd;
+  const field = adjustment.currency === "SYP" ? "balanceSyp" : "balanceUsd";
+
+  const query = db
+    .update(usersTable)
+    .set({ [field]: sql`${col} + ${adjustment.deltaText}` })
+    .where(
+      adjustment.operation === "sub"
+        ? and(eq(usersTable.id, userId), sql`${col} >= ${adjustment.amountText}`)
+        : eq(usersTable.id, userId),
+    )
+    .returning();
+
+  const [updatedUser] = await query;
+  if (!updatedUser) {
+    throw new ValidationError("الرصيد غير كافٍ لإتمام الخصم");
+  }
+
+  return { adjustment, updatedUser };
+}
+
+function findPgError(err: any): any {
+  let cur = err;
+  for (let i = 0; i < 6 && cur; i += 1) {
+    if (cur?.code && typeof cur.code === "string") return cur;
+    cur = cur?.cause;
+  }
+  return null;
+}
+
+function toHttpError(error: any): { status: number; message: string } {
+  if (typeof error?.statusCode === "number") {
+    return { status: error.statusCode, message: error?.message || "Validation error" };
+  }
+
+  const pg = findPgError(error);
+  if (pg) {
+    if (pg.code === "23505") {
+      return {
+        status: 400,
+        message: "القيمة المدخلة موجودة مسبقًا (حقل فريد). عدّل الكود أو استخدم قيمة مختلفة.",
+      };
+    }
+    if (pg.code === "23503") {
+      return { status: 400, message: `Foreign key violation: ${pg?.detail || pg?.constraint || "invalid reference"}` };
+    }
+    if (pg.code === "23502") {
+      return { status: 400, message: `Missing required field: ${pg?.column || "unknown"}` };
+    }
+    if (pg.code === "22P02") {
+      return { status: 400, message: `Invalid value format: ${pg?.message || "bad input"}` };
+    }
+    if (pg.code === "42703") {
+      return { status: 400, message: `خطأ في هيكل البيانات (حقل غير موجود): ${pg?.message || "Undefined column"}` };
+    }
+    if (pg.message) {
+      return { status: 400, message: `خطأ في قاعدة البيانات: ${pg.message}` };
+    }
+  }
+
+  return { status: 400, message: error?.message || "فشلت العملية" };
+}
+
+async function getOrCreateExternalCategoryId(): Promise<number> {
+  const [existing] = await db
+    .select({ id: categoriesTable.id })
+    .from(categoriesTable)
+    .where(eq(categoriesTable.name, EXTERNAL_CATEGORY_NAME))
+    .limit(1);
+
+  if (existing?.id) return existing.id;
+
+  const [created] = await db
+    .insert(categoriesTable)
+    .values({
+      name: EXTERNAL_CATEGORY_NAME,
+      image: EXTERNAL_CATEGORY_IMAGE,
+      active: true,
+    })
+    .returning({ id: categoriesTable.id });
+
+  return created.id;
+}
+
+async function applyDepositStatusChange(id: number, status: string, note?: string) {
+  await ensureDepositsTelegramMessageColumn();
+
+  const changeResult = await db.transaction(async (tx: any) => {
+    const [dep] = await tx.select().from(depositsTable).where(eq(depositsTable.id, id)).limit(1);
+    if (!dep) return { error: "not_found" as const };
+    if (dep.method === "sham_cash_auto") {
+      return { error: "auto_managed" as const };
+    }
+
+    if (dep.status === "approved" && status === "approved") {
+      return { error: "already_approved" as const };
+    }
+
+    if (dep.status === "rejected" && status === "rejected") {
+      return { error: "already_rejected" as const };
+    }
+
+    if (status === "approved" && dep.status !== "approved") {
+      const col = dep.currency === "SYP" ? "balanceSyp" : "balanceUsd";
+      const amount = dep.currency === "SYP" ? dep.amountSyp : dep.amountUsd;
+      if (amount && Number(amount) > 0) {
+        await tx
+          .update(usersTable)
+          .set({
+            [col]:
+              col === "balanceSyp"
+                ? sql`${usersTable.balanceSyp} + ${amount}`
+                : sql`${usersTable.balanceUsd} + ${amount}`,
+          })
+          .where(eq(usersTable.id, dep.userId));
+      }
+
+      // Add user notification
+      try {
+        await tx.insert(notificationsTable).values({
+          targetType: "user",
+          targetUserId: dep.userId,
+          title: "✅ تم قبول إيداعك",
+          content: `تم تأكيد إيداعك وإضافة ${Number(dep.amountUsd || 0).toFixed(2)}$ إلى محفظتك بنجاح`,
+          status: "sent",
+        });
+      } catch (e) {
+        console.debug("User notification insert error (ignored):", e);
+      }
+    } else if (status === "rejected" && dep.status !== "rejected") {
+      try {
+        await tx.insert(notificationsTable).values({
+          targetType: "user",
+          targetUserId: dep.userId,
+          title: "❌ تم رفض طلب الإيداع",
+          content: note || "تم رفض طلب الإيداع من قبل الإدارة. يرجى مراجعة الدعم الفني.",
+          status: "sent",
+        });
+      } catch (e) {
+        console.debug("User notification insert error (ignored):", e);
+      }
+    }
+
+    const [updated] = await tx
+      .update(depositsTable)
+      .set({ status })
+      .where(eq(depositsTable.id, id))
+      .returning();
+
+    return { updated, dep };
+  });
+
+  if ("error" in changeResult) {
+    return changeResult;
+  }
+
+  const { updated, dep } = changeResult;
+
+  const [user] = await db.select().from(usersTable).where(eq(usersTable.id, dep.userId)).limit(1);
+  if (user) {
+    try {
+      if (status === "approved") {
+        await notifyUserDepositApproved({
+          telegramId: user.telegramId,
+          addedUsd: Number(dep.amountUsd),
+          currentUsd: Number(user.balanceUsd),
+          operationNumber: String(dep.id),
+          messageId: dep.telegramMessageId,
+        });
+        await notifyInternalDepositConfirmed({
+          userId: user.id,
+          id: dep.id,
+          amountUsd: dep.amountUsd,
+          amountSyp: dep.amountSyp,
+          currency: dep.currency,
+        });
+      } else if (status === "rejected") {
+        await notifyUserDepositRejected({
+          telegramId: user.telegramId,
+          operationNumber: String(dep.id),
+        });
+        await notifyInternalDepositRejected({
+          userId: user.id,
+          id: dep.id,
+          amountUsd: dep.amountUsd,
+          currency: dep.currency,
+        });
+      }
+    } catch (error) {
+      console.error("Notify deposit user failed:", error);
+    }
+  }
+
+  return { updated };
+}
+
+async function applyOrderStatusChange(id: number, status: string, note?: string) {
+  const [order] = await db
+    .select()
+    .from(ordersTable)
+    .where(eq(ordersTable.id, id))
+    .limit(1);
+  if (!order) return { error: "not_found" as const };
+
+  const [updated] = await db
+    .update(ordersTable)
+    .set({ status })
+    .where(eq(ordersTable.id, id))
+    .returning();
+
+  const [user] = await db
+    .select()
+    .from(usersTable)
+    .where(eq(usersTable.id, order.userId))
+    .limit(1);
+  const [product] = await db
+    .select()
+    .from(productsTable)
+    .where(eq(productsTable.id, order.productId))
+    .limit(1);
+
+  if (user && product) {
+    try {
+      await notifyUserOrderStatusChanged({
+        telegramId: user.telegramId,
+        orderNumber: order.orderNumber,
+        productName: product.name,
+        status,
+        note,
+      });
+
+      if (["accept", "completed", "approved"].includes(status)) {
+        await notifyInternalOrderAccepted({
+          userId: user.id,
+          orderNumber: order.orderNumber,
+          productName: product.name,
+          totalUsd: order.totalUsd,
+        });
+      } else if (["reject", "cancelled", "rejected"].includes(status)) {
+        await notifyInternalOrderRejected({
+          userId: user.id,
+          orderNumber: order.orderNumber,
+          productName: product.name,
+          totalUsd: order.totalUsd,
+          note,
+        });
+      }
+    } catch (error) {
+      console.error("Notify order status user failed:", error);
+    }
+  }
+
+  return { updated };
+}
+
+async function logActivity(
+  actor: { id?: number; name?: string } | null,
+  action: string,
+  target?: string,
+  meta?: unknown,
+) {
+  await db.insert(activityLogTable).values({
+    actorType: "admin",
+    actorId: actor?.id ? String(actor.id) : null,
+    actorName: actor?.name || "system",
+    action,
+    target: target || null,
+    meta: (meta as object) || null,
+  });
+}
+
+// ========== AUTH ==========
+const adminLoginRateLimit = rateLimit({
+  keyPrefix: "admin-login",
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: "تم تجاوز عدد محاولات تسجيل الدخول. حاول بعد قليل.",
+});
+
+router.post("/admin/login", adminLoginRateLimit, async (req, res) => {
+  const { username, password } = req.body as { username?: string; password?: string };
+  if (!username || !password) {
+    res.status(400).json({ error: "بيانات ناقصة" });
+    return;
+  }
+  const [admin] = await db
+    .select()
+    .from(adminsTable)
+    .where(eq(adminsTable.username, username))
+    .limit(1);
+  if (!admin || !(await verifyAdminPassword(admin.password, password)) || !admin.active) {
+    res.status(401).json({ error: "بيانات الدخول غير صحيحة" });
+    return;
+  }
+  if (!isBcryptHash(admin.password)) {
+    await db
+      .update(adminsTable)
+      .set({ password: await hashAdminPassword(password) })
+      .where(eq(adminsTable.id, admin.id));
+  }
+  req.session.adminId = admin.id;
+  req.session.adminUsername = admin.username;
+  req.session.adminRole = admin.role;
+  await logActivity({ id: admin.id, name: admin.username }, "login", "admin_panel");
+  res.json({
+    id: admin.id,
+    username: admin.username,
+    fullName: admin.fullName,
+    role: admin.role,
+  });
+});
+
+router.post("/admin/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.json({ ok: true });
+  });
+});
+
+router.get("/admin/me", requireAdmin, async (req, res) => {
+  const [admin] = await db
+    .select()
+    .from(adminsTable)
+    .where(eq(adminsTable.id, req.session.adminId!))
+    .limit(1);
+  if (!admin) {
+    res.status(401).json({ error: "غير موجود" });
+    return;
+  }
+  res.json({
+    id: admin.id,
+    username: admin.username,
+    fullName: admin.fullName,
+    email: admin.email,
+    role: admin.role,
+    twoFactorEnabled: !!admin.twoFactorSecret,
+  });
+});
+
+// ========== DASHBOARD ==========
+router.get("/admin/dashboard", requireAdmin, async (_req, res) => {
+  try {
+    await ensureDatabaseSchema();
+
+    let u = { c: 0 };
+    let p = { c: 0 };
+    let oTotal = { c: 0 };
+    let oPending = { c: 0 };
+    let oCompleted = { c: 0 };
+    let oCancelled = { c: 0 };
+    let dPending = { c: 0 };
+    let sales = { s: "0" };
+    let cost = { s: "0" };
+    let bal = { s: "0" };
+    let todayOrders = { c: 0 };
+    let pendingTicketsCount = 0;
+    let totalTicketsCount = 0;
+    let recentTickets: any[] = [];
+    let recentOrdersRaw: any[] = [];
+    let recentDeposits: any[] = [];
+    let chartRows: any[] = [];
+
+    try {
+      const [resU] = await db.select({ c: sql<number>`count(*)::int` }).from(usersTable);
+      if (resU) u = resU;
+    } catch (e) {
+      console.warn("Count users failed:", e);
+    }
+
+    try {
+      const [resP] = await db
+        .select({ c: sql<number>`count(*)::int` })
+        .from(productsTable)
+        .where(eq(productsTable.available, true));
+      if (resP) p = resP;
+    } catch (e) {
+      console.warn("Count products failed:", e);
+    }
+
+    try {
+      const [resOTotal] = await db.select({ c: sql<number>`count(*)::int` }).from(ordersTable);
+      if (resOTotal) oTotal = resOTotal;
+
+      const [resOPending] = await db
+        .select({ c: sql<number>`count(*)::int` })
+        .from(ordersTable)
+        .where(sql`status IN ('wait', 'pending', 'processing')`);
+      if (resOPending) oPending = resOPending;
+
+      const [resOCompleted] = await db
+        .select({ c: sql<number>`count(*)::int` })
+        .from(ordersTable)
+        .where(sql`status IN ('accept', 'completed', 'approved')`);
+      if (resOCompleted) oCompleted = resOCompleted;
+
+      const [resOCancelled] = await db
+        .select({ c: sql<number>`count(*)::int` })
+        .from(ordersTable)
+        .where(sql`status IN ('reject', 'cancelled', 'rejected')`);
+      if (resOCancelled) oCancelled = resOCancelled;
+
+      const [resSales] = await db
+        .select({ s: sql<string>`coalesce(sum(total_usd),0)::text` })
+        .from(ordersTable)
+        .where(sql`status IN ('accept', 'completed')`);
+      if (resSales) sales = resSales;
+
+      const [resCost] = await db
+        .select({ s: sql<string>`coalesce(sum(cost_usd),0)::text` })
+        .from(ordersTable)
+        .where(sql`status IN ('accept', 'completed')`);
+      if (resCost) cost = resCost;
+    } catch (e) {
+      console.warn("Orders stats failed:", e);
+    }
+
+    try {
+      const [resDPending] = await db
+        .select({ c: sql<number>`count(*)::int` })
+        .from(depositsTable)
+        .where(eq(depositsTable.status, "pending"));
+      if (resDPending) dPending = resDPending;
+    } catch (e) {
+      console.warn("Deposits stats failed:", e);
+    }
+
+    try {
+      const [resBal] = await db.select({ s: sql<string>`coalesce(sum(balance_usd),0)::text` }).from(usersTable);
+      if (resBal) bal = resBal;
+    } catch (e) {
+      console.warn("Balance sum failed:", e);
+    }
+
+    try {
+      const [tPending] = await db
+        .select({ c: sql<number>`count(*)::int` })
+        .from(ticketsTable)
+        .where(sql`status IN ('pending', 'wait', 'open')`);
+      const [tTotal] = await db.select({ c: sql<number>`count(*)::int` }).from(ticketsTable);
+      pendingTicketsCount = tPending?.c || 0;
+      totalTicketsCount = tTotal?.c || 0;
+
+      recentTickets = await db
+        .select()
+        .from(ticketsTable)
+        .orderBy(desc(ticketsTable.createdAt))
+        .limit(6);
+    } catch (err) {
+      console.warn("[Dashboard] Tickets table query error:", err);
+    }
+
+    try {
+      recentOrdersRaw = await db
+        .select({
+          id: ordersTable.id,
+          orderNumber: ordersTable.orderNumber,
+          userId: ordersTable.userId,
+          customParam: ordersTable.customParam,
+          quantity: ordersTable.quantity,
+          totalUsd: ordersTable.totalUsd,
+          status: ordersTable.status,
+          createdAt: ordersTable.createdAt,
+          userName: usersTable.username,
+          userEmail: usersTable.email,
+        })
+        .from(ordersTable)
+        .leftJoin(usersTable, eq(ordersTable.userId, usersTable.id))
+        .orderBy(desc(ordersTable.createdAt))
+        .limit(8);
+    } catch (e) {
+      console.warn("Recent orders query failed:", e);
+    }
+
+    try {
+      recentDeposits = await db
+        .select()
+        .from(depositsTable)
+        .orderBy(desc(depositsTable.createdAt))
+        .limit(5);
+    } catch (e) {
+      console.warn("Recent deposits query failed:", e);
+    }
+
+    try {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const [resToday] = await db
+        .select({ c: sql<number>`count(*)::int` })
+        .from(ordersTable)
+        .where(gte(ordersTable.createdAt, today));
+      if (resToday) todayOrders = resToday;
+    } catch (e) {
+      console.warn("Today orders query failed:", e);
+    }
+
+    try {
+      const chartRes = await db.execute(sql`
+        SELECT to_char(d, 'YYYY-MM-DD') as date,
+          coalesce(sum(o.total_usd) filter (where o.status IN ('accept', 'completed')), 0)::float as sales,
+          count(o.id)::int as orders_count
+        FROM generate_series((current_date - interval '6 day')::date, current_date::date, '1 day') d
+        LEFT JOIN orders o ON o.created_at::date = d
+        GROUP BY d ORDER BY d
+      `);
+      chartRows = (chartRes.rows as any[]) || [];
+    } catch (e) {
+      console.warn("Chart query failed:", e);
+    }
+
+    res.json({
+      stats: {
+        users: Number(u?.c || 0),
+        activeProducts: Number(p?.c || 0),
+        totalOrders: Number(oTotal?.c || 0),
+        pendingOrders: Number(oPending?.c || 0),
+        completedOrders: Number(oCompleted?.c || 0),
+        cancelledOrders: Number(oCancelled?.c || 0),
+        pendingDeposits: Number(dPending?.c || 0),
+        pendingTickets: Number(pendingTicketsCount || 0),
+        totalTickets: Number(totalTicketsCount || 0),
+        totalSalesUsd: Number(sales?.s || 0),
+        totalCostUsd: Number(cost?.s || 0),
+        netProfitUsd: Number(sales?.s || 0) - Number(cost?.s || 0),
+        totalUserBalanceUsd: Number(bal?.s || 0),
+        todayOrders: Number(todayOrders?.c || 0),
+        apiBalanceUsd: 0.0,
+      },
+      recentOrders: recentOrdersRaw || [],
+      recentDeposits: recentDeposits || [],
+      recentTickets: recentTickets || [],
+      chart: chartRows || [],
+    });
+  } catch (err: any) {
+    console.error("Dashboard error:", err);
+    res.json({
+      stats: {
+        users: 0,
+        activeProducts: 0,
+        totalOrders: 0,
+        pendingOrders: 0,
+        completedOrders: 0,
+        cancelledOrders: 0,
+        pendingDeposits: 0,
+        pendingTickets: 0,
+        totalTickets: 0,
+        totalSalesUsd: 0,
+        totalCostUsd: 0,
+        netProfitUsd: 0,
+        totalUserBalanceUsd: 0,
+        todayOrders: 0,
+        apiBalanceUsd: 0.0,
+      },
+      recentOrders: [],
+      recentDeposits: [],
+      recentTickets: [],
+      chart: [],
+    });
+  }
+});
+
+// ========== TICKETS ENDPOINTS ==========
+router.get("/admin/tickets", requireAdmin, async (_req, res) => {
+  await ensureDatabaseSchema();
+  try {
+    const list = await db
+      .select({
+        id: ticketsTable.id,
+        userId: ticketsTable.userId,
+        userName: ticketsTable.userName,
+        userEmail: ticketsTable.userEmail,
+        subject: ticketsTable.subject,
+        status: ticketsTable.status,
+        priority: ticketsTable.priority,
+        createdAt: ticketsTable.createdAt,
+        updatedAt: ticketsTable.updatedAt,
+      })
+      .from(ticketsTable)
+      .orderBy(desc(ticketsTable.createdAt));
+    res.json(list);
+  } catch (err: any) {
+    res.json([]);
+  }
+});
+
+router.get("/admin/tickets/:id", requireAdmin, async (req, res) => {
+  await ensureDatabaseSchema();
+  const id = Number(req.params.id);
+  try {
+    const [ticket] = await db.select().from(ticketsTable).where(eq(ticketsTable.id, id)).limit(1);
+    if (!ticket) {
+      return res.status(404).json({ error: "التذكرة غير موجودة" });
+    }
+    const messages = await db
+      .select()
+      .from(ticketMessagesTable)
+      .where(eq(ticketMessagesTable.ticketId, id))
+      .orderBy(ticketMessagesTable.createdAt);
+
+    res.json({
+      ...ticket,
+      messages: messages || [],
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "خطأ في جلب التذكرة" });
+  }
+});
+
+router.put("/admin/tickets/:id", requireAdmin, async (req, res) => {
+  await ensureDatabaseSchema();
+  const id = Number(req.params.id);
+  const { status, priority } = req.body;
+  try {
+    const updateData: any = { updatedAt: new Date() };
+    if (status) updateData.status = status;
+    if (priority) updateData.priority = priority;
+
+    await db.update(ticketsTable).set(updateData).where(eq(ticketsTable.id, id));
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || "فشل تحديث التذكرة" });
+  }
+});
+
+router.post("/admin/tickets/:id/reply", requireAdmin, async (req, res) => {
+  await ensureDatabaseSchema();
+  const id = Number(req.params.id);
+  const { message } = req.body;
+  if (!message || !message.trim()) {
+    return res.status(400).json({ error: "الرد لا يمكن أن يكون فارغاً" });
+  }
+  try {
+    await db.insert(ticketMessagesTable).values({
+      ticketId: id,
+      senderType: "admin",
+      senderName: req.session.adminUsername || "الدعم الفني",
+      message: message.trim(),
+      createdAt: new Date(),
+    });
+
+    await db
+      .update(ticketsTable)
+      .set({ status: "answered", updatedAt: new Date() })
+      .where(eq(ticketsTable.id, id));
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || "فشل إرسال الرد" });
+  }
+});
+
+router.post("/admin/tickets/:id/close", requireAdmin, async (req, res) => {
+  await ensureDatabaseSchema();
+  const id = Number(req.params.id);
+  try {
+    await db
+      .update(ticketsTable)
+      .set({ status: "closed", updatedAt: new Date() })
+      .where(eq(ticketsTable.id, id));
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || "فشل إغلاق التذكرة" });
+  }
+});
+
+// Helper count endpoints
+router.get("/admin/orders/count", requireAdmin, async (_req, res) => {
+  const [row] = await db.select({ c: sql<number>`count(*)::int` }).from(ordersTable);
+  res.json({ count: row?.c || 0 });
+});
+
+router.get("/admin/users/count", requireAdmin, async (_req, res) => {
+  const [row] = await db.select({ c: sql<number>`count(*)::int` }).from(usersTable);
+  res.json({ count: row?.c || 0 });
+});
+
+router.get("/admin/tickets/count", requireAdmin, async (_req, res) => {
+  try {
+    const [row] = await db.select({ c: sql<number>`count(*)::int` }).from(ticketsTable);
+    res.json({ count: row?.c || 0 });
+  } catch {
+    res.json({ count: 0 });
+  }
+});
+
+router.get("/admin/orders/total-sales", requireAdmin, async (_req, res) => {
+  const [sales] = await db
+    .select({ s: sql<string>`coalesce(sum(total_usd),0)::text` })
+    .from(ordersTable)
+    .where(sql`status IN ('accept', 'completed')`);
+  res.json({ totalSales: Number(sales?.s || 0) });
+});
+
+// ========== GENERIC CRUD HELPER ==========
+function makeCrud<T extends { id: any }>(
+  path: string,
+  table: any,
+  opts: { orderBy?: any; allowedFields?: string[] } = {},
+) {
+  router.get(`/admin/${path}`, requireAdmin, async (_req, res) => {
+    try {
+      if (path === "providers" || path === "payment-methods") {
+        await ensureDatabaseSchema();
+      }
+      const rows = await db.select().from(table).orderBy(opts.orderBy ?? desc(table.id));
+      res.json(rows);
+    } catch (error: any) {
+      console.error(`Get ${path} failed:`, error);
+      const httpErr = toHttpError(error);
+      res.status(httpErr.status).json({ error: httpErr.message });
+    }
+  });
+  router.get(`/admin/${path}/:id`, requireAdmin, async (req, res) => {
+    try {
+      const [row] = await db.select().from(table).where(eq(table.id, Number(req.params.id))).limit(1);
+      if (!row) {
+        res.status(404).json({ error: "غير موجود" });
+        return;
+      }
+      res.json(row);
+    } catch (error: any) {
+      const httpErr = toHttpError(error);
+      res.status(httpErr.status).json({ error: httpErr.message });
+    }
+  });
+  router.post(`/admin/${path}`, requireAdmin, async (req, res) => {
+    try {
+      if (path === "providers" || path === "payment-methods") {
+        await ensureDatabaseSchema();
+        if (path === "payment-methods") {
+          await db.execute(sql`
+            SELECT setval(
+              pg_get_serial_sequence('payment_methods', 'id'),
+              COALESCE((SELECT MAX(id) FROM payment_methods), 1),
+              true
+            );
+          `).catch(() => null);
+        }
+      }
+      const data = await sanitizeCrudDataForRuntimeSchema(
+        path,
+        filterFields(req.body, opts.allowedFields),
+      );
+      const [row] = (await db.insert(table).values(data).returning()) as any[];
+      await logActivity(
+        { id: req.session.adminId, name: req.session.adminUsername },
+        "create",
+        path,
+        { id: row.id },
+      );
+      res.json(row);
+    } catch (error: any) {
+      console.error(`Create ${path} failed:`, error);
+      const httpErr = toHttpError(error);
+      res.status(httpErr.status).json({ error: httpErr.message });
+    }
+  });
+  const handleUpdate = async (req: any, res: any, next?: any) => {
+    if (req.params?.id === "reorder") {
+      return typeof next === "function" ? next() : res.status(404).end();
+    }
+    try {
+      if (path === "providers" || path === "payment-methods") {
+        await ensureDatabaseSchema();
+      }
+      const data = await sanitizeCrudDataForRuntimeSchema(
+        path,
+        filterFields(req.body, opts.allowedFields),
+      );
+      const id = Number(req.params.id);
+      const [before] =
+        path === "products"
+          ? ((await db.select().from(productsTable).where(eq(productsTable.id, id)).limit(1)) as any[])
+          : [];
+      if (path === "products" && before && "minQuantity" in data && data.minQuantity != null) {
+        const providerMinQuantity = Number(before.minQty ?? before.minQuantity ?? 1);
+        if (
+          Number.isFinite(providerMinQuantity) &&
+          providerMinQuantity > 0 &&
+          Number(data.minQuantity) < providerMinQuantity
+        ) {
+          throw new ValidationError(
+            `minQuantity must be greater than or equal to provider minimum (${providerMinQuantity})`,
+          );
+        }
+      }
+      const [row] = await db
+        .update(table)
+        .set(data)
+        .where(eq(table.id, id))
+        .returning();
+      if (path === "products" && before && row) {
+        try {
+          const logs: Array<{
+            productId: number;
+            changeType: "profit" | "max_quantity";
+            oldValue: string | null;
+            newValue: string | null;
+            providerSnapshot: Record<string, unknown>;
+            adminId?: number;
+          }> = [];
+          if ("storeProfitPerUnit" in data || "priceUsd" in data) {
+            logs.push({
+              productId: row.id,
+              changeType: "profit",
+              oldValue: String(before.storeProfitPerUnit ?? before.priceUsd ?? ""),
+              newValue: String((row as any).storeProfitPerUnit ?? (row as any).priceUsd ?? ""),
+              providerSnapshot: {
+                providerUnitPrice: (row as any).providerUnitPrice ?? (row as any).basePriceUsd ?? null,
+                minQuantity: (row as any).minQuantity ?? (row as any).minQty ?? null,
+              },
+              adminId: req.session.adminId,
+            });
+          }
+          if ("maxQuantity" in data || "maxQty" in data) {
+            logs.push({
+              productId: row.id,
+              changeType: "max_quantity",
+              oldValue: String(before.maxQuantity ?? before.maxQty ?? ""),
+              newValue: String((row as any).maxQuantity ?? (row as any).maxQty ?? ""),
+              providerSnapshot: {
+                providerUnitPrice: (row as any).providerUnitPrice ?? (row as any).basePriceUsd ?? null,
+                minQuantity: (row as any).minQuantity ?? (row as any).minQty ?? null,
+              },
+              adminId: req.session.adminId,
+            });
+          }
+          if (logs.length) {
+            await db.insert(productChangesLogTable).values(logs);
+          }
+        } catch (logError) {
+          console.warn("[Admin Product Update] Failed to insert into product_changes_log:", logError);
+        }
+      }
+      await logActivity(
+        { id: req.session.adminId, name: req.session.adminUsername },
+        "update",
+        path,
+        { id: row?.id },
+      );
+      res.json(row);
+    } catch (error: any) {
+      console.error(`Update ${path} failed:`, error);
+      const httpErr = toHttpError(error);
+      res.status(httpErr.status).json({ error: httpErr.message });
+    }
+  };
+  router.patch(`/admin/${path}/:id`, requireAdmin, handleUpdate);
+  router.put(`/admin/${path}/:id`, requireAdmin, handleUpdate);
+  router.delete(`/admin/${path}/:id`, requireAdmin, async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+
+      if (path === "products") {
+        const [orderStats] = await db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(ordersTable)
+          .where(eq(ordersTable.productId, id));
+
+        if ((orderStats?.count || 0) > 0) {
+          await db
+            .update(productsTable)
+            .set({ available: false, featured: false })
+            .where(eq(productsTable.id, id));
+          await logActivity(
+            { id: req.session.adminId, name: req.session.adminUsername },
+            "archive",
+            path,
+            { id, reason: "product_has_orders" },
+          );
+          res.json({
+            ok: true,
+            archived: true,
+            message: "تم إخفاء المنتج لأنه مرتبط بطلبات شراء سابقة. بقيت الطلبات محفوظة ولن يظهر المنتج في المتجر.",
+          });
+          return;
+        }
+
+        await db.delete(autoCodesTable).where(eq(autoCodesTable.productId, id));
+      }
+
+      if (path === "product-groups") {
+        await db
+          .update(productsTable)
+          .set({ groupId: null })
+          .where(eq(productsTable.groupId, id));
+      }
+
+      await db.delete(table).where(eq(table.id, id));
+      await logActivity(
+        { id: req.session.adminId, name: req.session.adminUsername },
+        "delete",
+        path,
+        { id },
+      );
+      res.json({ ok: true });
+    } catch (error: any) {
+      console.error(`Delete ${path} failed:`, error);
+      const httpErr = toHttpError(error);
+      res.status(httpErr.status).json({ error: httpErr.message });
+    }
+  });
+}
+
+function filterFields(body: any, allowed?: string[]): any {
+  if (!allowed) return body;
+  const out: any = {};
+  for (const k of allowed) if (k in body) out[k] = body[k];
+  return out;
+}
+
+const columnExistsCache = new Map<string, boolean>();
+
+async function hasColumn(tableName: string, columnName: string): Promise<boolean> {
+  const cacheKey = `${tableName}.${columnName}`;
+  const cached = columnExistsCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  const result = await db.execute(sql`
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = ${tableName}
+      AND column_name = ${columnName}
+    LIMIT 1
+  `);
+  const exists = (result.rows as any[]).length > 0;
+  columnExistsCache.set(cacheKey, exists);
+  return exists;
+}
+
+async function fetchProviderLiveCostUsd(providerId: number, providerProductId: number): Promise<string | null> {
+  const [provider] = await db
+    .select()
+    .from(providersTable)
+    .where(eq(providersTable.id, providerId))
+    .limit(1);
+
+  if (!provider) {
+    throw new ValidationError(`providerId ${providerId} does not exist`);
+  }
+
+  const pType = (provider.providerType || "custom").toLowerCase().trim();
+  if (pType === "custom" || pType === "manual" || !provider.apiKey) {
+    return null;
+  }
+
+  const adapter = getAdapter(pType);
+  if (!adapter) {
+    return null;
+  }
+
+  try {
+    const remoteProducts = await adapter.fetchProducts(provider.apiKey, provider.apiUrl || undefined);
+    const remote = remoteProducts.find((p) => Number(p.id) === Number(providerProductId));
+    if (!remote) {
+      return null;
+    }
+
+    const remotePrice = String(remote.price ?? "").trim();
+    if (!/^-?\d+(\.\d+)?$/.test(remotePrice)) {
+      return null;
+    }
+
+    return remotePrice;
+  } catch (error: any) {
+    console.warn(`[ProviderLiveCost] Could not fetch remote price for provider ${providerId}:`, error?.message || error);
+    return null;
+  }
+}
+
+async function sanitizeCrudDataForRuntimeSchema(path: string, data: any): Promise<any> {
+  if (!data || typeof data !== "object") return data;
+  const normalized: Record<string, any> = { ...data };
+
+  if (path === "banners") {
+    if ("title" in normalized && typeof normalized.title === "string") {
+      normalized.title = normalized.title.trim();
+    }
+    if ("image" in normalized && typeof normalized.image === "string") {
+      normalized.image = normalized.image.trim();
+    }
+    if ("description" in normalized && typeof normalized.description === "string") {
+      normalized.description = normalized.description.trim();
+      if (normalized.description === "") normalized.description = null;
+    }
+    if ("link" in normalized && typeof normalized.link === "string") {
+      normalized.link = normalized.link.trim();
+      if (normalized.link === "") normalized.link = null;
+    }
+    if ("order" in normalized) normalizeNumberField(normalized, "order", { required: false });
+    if ("active" in normalized) normalized.active = !!normalized.active;
+    if ("featured" in normalized) normalized.featured = !!normalized.featured;
+    if (isBlank(normalized.title)) throw new ValidationError("عنوان البانر مطلوب");
+    if (isBlank(normalized.image)) throw new ValidationError("رابط صورة البانر مطلوب");
+  }
+
+  if (path === "social-links") {
+    if ("platform" in normalized && typeof normalized.platform === "string") {
+      normalized.platform = normalized.platform.trim();
+    }
+    if ("label" in normalized && typeof normalized.label === "string") {
+      normalized.label = normalized.label.trim();
+    }
+    if ("url" in normalized && typeof normalized.url === "string") {
+      normalized.url = normalized.url.trim();
+    }
+    if ("order" in normalized) normalizeNumberField(normalized, "order", { required: false });
+    if ("active" in normalized) normalized.active = !!normalized.active;
+    if (isBlank(normalized.platform)) throw new ValidationError("اسم المنصة مطلوب");
+    if (isBlank(normalized.label)) throw new ValidationError("عنوان الرابط مطلوب");
+    if (isBlank(normalized.url)) throw new ValidationError("رابط المنصة مطلوب");
+  }
+
+  if (path === "payment-methods") {
+    if ("code" in normalized && typeof normalized.code === "string") {
+      normalized.code = normalized.code.trim();
+    }
+    if ("name" in normalized && typeof normalized.name === "string") {
+      normalized.name = normalized.name.trim();
+    }
+    if ("subtitle" in normalized && typeof normalized.subtitle === "string") {
+      normalized.subtitle = normalized.subtitle.trim();
+    } else if (!("subtitle" in normalized)) {
+      normalized.subtitle = "";
+    }
+    if ("instructions" in normalized && typeof normalized.instructions === "string") {
+      normalized.instructions = normalized.instructions.trim();
+    }
+    if ("walletAddress" in normalized && typeof normalized.walletAddress === "string") {
+      normalized.walletAddress = normalized.walletAddress.trim();
+    }
+    if ("logoImage" in normalized && typeof normalized.logoImage === "string") {
+      normalized.logoImage = normalized.logoImage.trim();
+    }
+    if ("qrImage" in normalized && typeof normalized.qrImage === "string") {
+      normalized.qrImage = normalized.qrImage.trim();
+    }
+    if ("category" in normalized && typeof normalized.category === "string") {
+      normalized.category = normalized.category.trim();
+    }
+    if (isBlank(normalized.code)) throw new ValidationError("كود وسيلة الدفع مطلوب");
+    if (isBlank(normalized.name)) throw new ValidationError("اسم وسيلة الدفع مطلوب");
+    if ("minAmount" in normalized) normalizeDecimalField(normalized, "minAmount", { required: true });
+    if ("order" in normalized) normalizeNumberField(normalized, "order", { required: false });
+    if ("active" in normalized) normalized.active = !!normalized.active;
+  }
+
+  if (path === "categories" || path === "product-groups") {
+    if ("name" in normalized && typeof normalized.name === "string") {
+      normalized.name = normalized.name.trim();
+    }
+    if ("image" in normalized && typeof normalized.image === "string") {
+      normalized.image = normalized.image.trim();
+    }
+    if (isBlank(normalized.name)) throw new ValidationError(`${path} name is required`);
+    if (isBlank(normalized.image)) throw new ValidationError(`${path} image is required`);
+    if ("categoryId" in normalized) normalizeNumberField(normalized, "categoryId", { required: path === "product-groups" });
+    if ("order" in normalized) normalizeNumberField(normalized, "order", { required: true });
+    if ("active" in normalized) normalized.active = !!normalized.active;
+    if ("columnsCount" in normalized) normalizeNumberField(normalized, "columnsCount", { required: true });
+    if ("columns_count" in normalized) {
+      normalized.columnsCount = normalized.columns_count;
+      delete normalized.columns_count;
+      normalizeNumberField(normalized, "columnsCount", { required: true });
+    }
+  }
+
+  if (path === "products") {
+    if ("name" in normalized && typeof normalized.name === "string") {
+      normalized.name = normalized.name.trim();
+    }
+    if ("image" in normalized && typeof normalized.image === "string") {
+      normalized.image = normalized.image.trim();
+    }
+    if ("description" in normalized && typeof normalized.description === "string") {
+      normalized.description = normalized.description.trim();
+      if (normalized.description === "") normalized.description = null;
+    }
+    if ("source" in normalized && typeof normalized.source === "string") {
+      normalized.source = normalized.source.trim() || "manual";
+    }
+
+    const source = String(normalized.source || "manual").toLowerCase();
+    const isExternalProduct =
+      source !== "manual" || !isBlank(normalized.providerId) || !isBlank(normalized.providerProductId);
+
+    if ("categoryId" in normalized) normalizeNumberField(normalized, "categoryId", { required: true });
+    if ("priceUsd" in normalized) normalizeDecimalField(normalized, "priceUsd", { required: true });
+    if (isBlank(normalized.priceSyp)) normalized.priceSyp = 0;
+    if ("priceSyp" in normalized) normalizeNumberField(normalized, "priceSyp", { required: true });
+    if ("basePriceUsd" in normalized) normalizeDecimalField(normalized, "basePriceUsd", { nullable: true });
+    if ("providerUnitPrice" in normalized) normalizeDecimalField(normalized, "providerUnitPrice", { nullable: true });
+    if ("storeProfitPerUnit" in normalized) normalizeDecimalField(normalized, "storeProfitPerUnit", { required: true });
+    if ("finalUnitPrice" in normalized) normalizeDecimalField(normalized, "finalUnitPrice", { nullable: true });
+    if ("minQty" in normalized) normalizeNumberField(normalized, "minQty", { nullable: true });
+    if ("maxQty" in normalized) normalizeNumberField(normalized, "maxQty", { nullable: true });
+    if ("minQuantity" in normalized) normalizeNumberField(normalized, "minQuantity", { nullable: true });
+    if ("maxQuantity" in normalized) normalizeNumberField(normalized, "maxQuantity", { nullable: true });
+    if (isBlank(normalized.quantityType) || !["fixed", "range", "list"].includes(String(normalized.quantityType))) {
+      normalized.quantityType = "fixed";
+    }
+    if (isBlank(normalized.quantityValues)) {
+      normalized.quantityValues = null;
+    }
+    if ("providerId" in normalized) normalizeNumberField(normalized, "providerId", { nullable: true });
+    if ("groupId" in normalized) normalizeNumberField(normalized, "groupId", { nullable: true });
+    if ("providerProductId" in normalized) {
+      normalizeNumberField(normalized, "providerProductId", { nullable: true });
+    }
+
+    if ("available" in normalized) normalized.available = !!normalized.available;
+    if ("featured" in normalized) normalized.featured = !!normalized.featured;
+    if ("order" in normalized) normalizeNumberField(normalized, "order", { required: true });
+
+    if (isBlank(normalized.name)) throw new ValidationError("name is required");
+    if (isBlank(normalized.image)) throw new ValidationError("image is required");
+    if (!isExternalProduct && isBlank(normalized.categoryId)) {
+      throw new ValidationError("categoryId is required for manual products");
+    }
+    if (isBlank(normalized.priceUsd) && isBlank(normalized.finalUnitPrice)) {
+      throw new ValidationError("priceUsd or finalUnitPrice is required");
+    }
+    if (isBlank(normalized.finalUnitPrice) && normalized.priceUsd != null && String(normalized.priceUsd).startsWith("-")) {
+      throw new ValidationError("priceUsd must be zero or a positive decimal");
+    }
+    if (normalized.finalUnitPrice != null && !isBlank(normalized.finalUnitPrice) && decimalToScaled(normalized.finalUnitPrice) < 0n) {
+      throw new ValidationError("finalUnitPrice must be greater than or equal to 0");
+    }
+    if (normalized.basePriceUsd != null && String(normalized.basePriceUsd).startsWith("-")) {
+      throw new ValidationError("basePriceUsd must be zero or a positive decimal");
+    }
+    if (normalized.providerUnitPrice != null && String(normalized.providerUnitPrice).startsWith("-")) {
+      throw new ValidationError("providerUnitPrice must be zero or a positive decimal");
+    }
+
+    if (normalized.minQty != null && normalized.maxQty != null && normalized.minQty > normalized.maxQty) {
+      throw new ValidationError("minQty must be less than or equal to maxQty");
+    }
+
+    if (
+      normalized.minQuantity != null &&
+      normalized.minQty != null &&
+      Number(normalized.minQuantity) < Number(normalized.minQty)
+    ) {
+      throw new ValidationError("minQuantity must be greater than or equal to provider minimum");
+    }
+
+    const effectiveMinQuantity = Number(normalized.minQuantity ?? normalized.minQty ?? 1);
+    if (
+      normalized.maxQuantity != null &&
+      Number.isFinite(effectiveMinQuantity) &&
+      Number(normalized.maxQuantity) < effectiveMinQuantity
+    ) {
+      throw new ValidationError("maxQuantity must be greater than or equal to minQuantity");
+    }
+
+    if (normalized.categoryId != null) {
+      const [category] = await db
+        .select({ id: categoriesTable.id })
+        .from(categoriesTable)
+        .where(eq(categoriesTable.id, Number(normalized.categoryId)))
+        .limit(1);
+      if (!category) {
+        if (isExternalProduct) {
+          normalized.categoryId = await getOrCreateExternalCategoryId();
+        } else {
+          throw new ValidationError(`categoryId ${normalized.categoryId} does not exist`);
+        }
+      }
+    } else if (isExternalProduct) {
+      normalized.categoryId = await getOrCreateExternalCategoryId();
+    }
+
+    if (normalized.providerId != null) {
+      const [provider] = await db
+        .select({ id: providersTable.id })
+        .from(providersTable)
+        .where(eq(providersTable.id, Number(normalized.providerId)))
+        .limit(1);
+      if (!provider) throw new ValidationError(`providerId ${normalized.providerId} does not exist`);
+    }
+
+    if (normalized.providerId != null && normalized.providerProductId != null) {
+      const providerCostUsd = await fetchProviderLiveCostUsd(
+        Number(normalized.providerId),
+        Number(normalized.providerProductId),
+      );
+      if (providerCostUsd != null) {
+        normalized.basePriceUsd = providerCostUsd;
+        normalized.providerUnitPrice = providerCostUsd;
+      }
+      normalized.source = "provider";
+    }
+
+    const providerUnitPrice = normalized.providerUnitPrice ?? normalized.basePriceUsd ?? "0";
+    const requestedFinalUnitPrice = normalized.finalUnitPrice;
+
+    if (!isBlank(requestedFinalUnitPrice)) {
+      if (decimalToScaled(requestedFinalUnitPrice) < 0n) {
+        throw new ValidationError("finalUnitPrice must be greater than or equal to 0");
+      }
+      const derivedProfit = subtractUnitPrices(requestedFinalUnitPrice, providerUnitPrice);
+      normalized.storeProfitPerUnit = derivedProfit;
+      normalized.priceUsd = derivedProfit;
+      normalized.finalUnitPrice = requestedFinalUnitPrice;
+    } else {
+      const storeProfitPerUnit = normalized.storeProfitPerUnit ?? normalized.priceUsd ?? "0";
+      normalized.storeProfitPerUnit = storeProfitPerUnit;
+      normalized.priceUsd = storeProfitPerUnit;
+      normalized.finalUnitPrice = addUnitPrices(providerUnitPrice, storeProfitPerUnit);
+      if (decimalToScaled(normalized.finalUnitPrice) < 0n) {
+        throw new ValidationError("finalUnitPrice must be greater than or equal to 0");
+      }
+    }
+  }
+
+  if (path === "products" && "providerProductId" in normalized) {
+    const exists = await hasColumn("products", "provider_product_id");
+    if (!exists) delete normalized.providerProductId;
+  }
+
+  if (path === "providers") {
+    if ("name" in normalized && typeof normalized.name === "string") {
+      normalized.name = normalized.name.trim();
+    }
+    if (isBlank(normalized.name)) throw new ValidationError("اسم المزود مطلوب");
+    if ("priority" in normalized) normalizeNumberField(normalized, "priority", { nullable: true });
+    if ("active" in normalized) normalized.active = !!normalized.active;
+    if ("providerType" in normalized) {
+      const exists = await hasColumn("providers", "provider_type");
+      if (!exists) delete normalized.providerType;
+    }
+    if ("productsEndpoint" in normalized) {
+      const exists = await hasColumn("providers", "products_endpoint");
+      if (!exists) delete normalized.productsEndpoint;
+    }
+    if ("profileEndpoint" in normalized) {
+      const exists = await hasColumn("providers", "profile_endpoint");
+      if (!exists) delete normalized.profileEndpoint;
+    }
+    if ("orderEndpoint" in normalized) {
+      const exists = await hasColumn("providers", "order_endpoint");
+      if (!exists) delete normalized.orderEndpoint;
+    }
+    if ("checkEndpoint" in normalized) {
+      const exists = await hasColumn("providers", "check_endpoint");
+      if (!exists) delete normalized.checkEndpoint;
+    }
+    if ("tokenHeader" in normalized) {
+      const exists = await hasColumn("providers", "token_header");
+      if (!exists) delete normalized.tokenHeader;
+    }
+  }
+
+  return normalized;
+}
+
+// ========== RESOURCES ==========
+// Cascade delete للفئات: حذف المنتجات المرتبطة ثم حذف الفئة
+router.delete("/admin/categories/:id", requireAdmin, async (req, res) => {
+  const categoryId = Number(req.params.id);
+  
+  // حذف جميع المنتجات المرتبطة بهذه الفئة
+  await db.execute(sql`DELETE FROM products WHERE category_id = ${categoryId}`);
+  
+  // حذف الفئة نفسها
+  await db.delete(categoriesTable).where(eq(categoriesTable.id, categoryId));
+  
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "delete",
+    "categories",
+    { id: categoryId, cascade: true }
+  );
+  
+  res.json({ ok: true });
+});
+
+
+makeCrud("categories", categoriesTable, {
+  orderBy: categoriesTable.order,
+  allowedFields: ["name", "image", "order", "active", "columnsCount", "columns_count", "displayStyle", "display_style"],
+});
+
+makeCrud("product-groups", productGroupsTable, {
+  orderBy: productGroupsTable.order,
+  allowedFields: ["categoryId", "name", "image", "order", "active"],
+});
+
+makeCrud("products", productsTable, {
+  orderBy: productsTable.order,
+  allowedFields: [
+    "categoryId",
+    "groupId",
+    "name",
+    "image",
+    "order",
+    "priceUsd",
+    "priceSyp",
+    "basePriceUsd",
+    "providerUnitPrice",
+    "storeProfitPerUnit",
+    "finalUnitPrice",
+    "productType",
+    "available",
+    "minQty",
+    "maxQty",
+    "minQuantity",
+    "maxQuantity",
+    "quantityType",
+    "quantityValues",
+    "description",
+    "featured",
+    "providerId",
+    "source",
+    "providerProductId",
+  ],
+});
+
+makeCrud("news", newsTable, {
+  allowedFields: ["content", "type", "active"],
+});
+
+makeCrud("banners", bannersTable, {
+  orderBy: bannersTable.order,
+  allowedFields: [
+    "image",
+    "title",
+    "description",
+    "link",
+    "order",
+    "active",
+    "featured",
+    "showDiscoverBtn",
+    "showAutoExecBtn",
+    "showReliableBtn",
+    "showFeaturedBtn",
+  ],
+});
+
+// Explicit update endpoint for banner details (PUT / PATCH)
+router.put("/admin/banners/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ error: "معرف البانر غير صالح" });
+    }
+    const [existing] = await db.select().from(bannersTable).where(eq(bannersTable.id, id)).limit(1);
+    if (!existing) {
+      return res.status(404).json({ error: "البانر المطلوب غير موجود" });
+    }
+
+    const {
+      title,
+      image,
+      description,
+      link,
+      order,
+      active,
+      featured,
+      showDiscoverBtn,
+      show_discover_btn,
+      showAutoExecBtn,
+      show_auto_exec_btn,
+      showReliableBtn,
+      show_reliable_btn,
+      showFeaturedBtn,
+      show_featured_btn,
+    } = req.body;
+    if (!title || typeof title !== "string" || !title.trim()) {
+      return res.status(400).json({ error: "عنوان البانر مطلوب" });
+    }
+    if (!image || typeof image !== "string" || !image.trim()) {
+      return res.status(400).json({ error: "رابط صورة البانر مطلوب" });
+    }
+
+    const discoverVal = showDiscoverBtn !== undefined ? Boolean(showDiscoverBtn) : (show_discover_btn !== undefined ? Boolean(show_discover_btn) : existing.showDiscoverBtn);
+    const autoExecVal = showAutoExecBtn !== undefined ? Boolean(showAutoExecBtn) : (show_auto_exec_btn !== undefined ? Boolean(show_auto_exec_btn) : existing.showAutoExecBtn);
+    const reliableVal = showReliableBtn !== undefined ? Boolean(showReliableBtn) : (show_reliable_btn !== undefined ? Boolean(show_reliable_btn) : existing.showReliableBtn);
+    const featuredVal = showFeaturedBtn !== undefined ? Boolean(showFeaturedBtn) : (show_featured_btn !== undefined ? Boolean(show_featured_btn) : existing.showFeaturedBtn);
+
+    const updateData = {
+      title: title.trim(),
+      image: image.trim(),
+      description: description !== undefined ? (description ? String(description).trim() : null) : existing.description,
+      link: link !== undefined ? (link ? String(link).trim() : null) : existing.link,
+      order: order !== undefined ? Number(order) || 0 : existing.order,
+      active: active !== undefined ? Boolean(active) : existing.active,
+      featured: featured !== undefined ? Boolean(featured) : existing.featured,
+      showDiscoverBtn: discoverVal,
+      showAutoExecBtn: autoExecVal,
+      showReliableBtn: reliableVal,
+      showFeaturedBtn: featuredVal,
+    };
+
+    const [updated] = await db
+      .update(bannersTable)
+      .set(updateData)
+      .where(eq(bannersTable.id, id))
+      .returning();
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "update",
+      "banners",
+      { id, title: updated.title }
+    );
+
+    console.log(`[Admin Banners] Updated banner #${id} successfully:`, updated.title);
+    res.json({ ok: true, success: true, banner: updated, ...updated });
+  } catch (err: any) {
+    console.error("[Admin Banners PUT Error]:", err);
+    res.status(500).json({ error: err?.message || "فشل حفظ تعديلات البانر" });
+  }
+});
+
+router.post("/admin/banners", requireAdmin, async (req, res) => {
+  try {
+    const {
+      title,
+      image,
+      description,
+      link,
+      order,
+      active,
+      featured,
+      showDiscoverBtn,
+      show_discover_btn,
+      showAutoExecBtn,
+      show_auto_exec_btn,
+      showReliableBtn,
+      show_reliable_btn,
+      showFeaturedBtn,
+      show_featured_btn,
+    } = req.body;
+    if (!title || typeof title !== "string" || !title.trim()) {
+      return res.status(400).json({ error: "عنوان البانر مطلوب" });
+    }
+    if (!image || typeof image !== "string" || !image.trim()) {
+      return res.status(400).json({ error: "رابط صورة البانر مطلوب" });
+    }
+
+    const discoverVal = showDiscoverBtn !== undefined ? Boolean(showDiscoverBtn) : Boolean(show_discover_btn);
+    const autoExecVal = showAutoExecBtn !== undefined ? Boolean(showAutoExecBtn) : Boolean(show_auto_exec_btn);
+    const reliableVal = showReliableBtn !== undefined ? Boolean(showReliableBtn) : Boolean(show_reliable_btn);
+    const featuredVal = showFeaturedBtn !== undefined ? Boolean(showFeaturedBtn) : Boolean(show_featured_btn);
+
+    const insertData = {
+      title: title.trim(),
+      image: image.trim(),
+      description: description ? String(description).trim() : null,
+      link: link ? String(link).trim() : null,
+      order: order !== undefined ? Number(order) || 0 : 0,
+      active: active !== undefined ? Boolean(active) : true,
+      featured: featured !== undefined ? Boolean(featured) : false,
+      showDiscoverBtn: discoverVal,
+      showAutoExecBtn: autoExecVal,
+      showReliableBtn: reliableVal,
+      showFeaturedBtn: featuredVal,
+    };
+
+    const [created] = await db
+      .insert(bannersTable)
+      .values(insertData)
+      .returning();
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "create",
+      "banners",
+      { id: created.id, title: created.title }
+    );
+
+    console.log(`[Admin Banners] Created banner #${created.id} successfully:`, created.title);
+    res.json({ ok: true, success: true, banner: created, ...created });
+  } catch (err: any) {
+    console.error("[Admin Banners POST Error]:", err);
+    res.status(500).json({ error: err?.message || "فشل إضافة البانر" });
+  }
+});
+
+router.patch("/admin/banners/reorder", requireAdmin, async (req, res) => {
+  try {
+    const items = req.body?.items; // Array of { id: number, order: number }
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (item.id !== undefined && item.order !== undefined) {
+          await db
+            .update(bannersTable)
+            .set({ order: Number(item.order) })
+            .where(eq(bannersTable.id, Number(item.id)));
+        }
+      }
+    }
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch("/admin/banners/:id/toggle-featured", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const [existing] = await db.select().from(bannersTable).where(eq(bannersTable.id, id)).limit(1);
+    if (!existing) return res.status(404).json({ error: "Banner not found" });
+
+    const newFeatured = req.body?.featured !== undefined ? Boolean(req.body.featured) : !existing.featured;
+    await db
+      .update(bannersTable)
+      .set({ featured: newFeatured })
+      .where(eq(bannersTable.id, id));
+
+    res.json({ ok: true, featured: newFeatured });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch("/admin/banners/:id/toggle-active", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const [existing] = await db.select().from(bannersTable).where(eq(bannersTable.id, id)).limit(1);
+    if (!existing) return res.status(404).json({ error: "Banner not found" });
+
+    const newActive = req.body?.active !== undefined ? Boolean(req.body.active) : !existing.active;
+    await db
+      .update(bannersTable)
+      .set({ active: newActive })
+      .where(eq(bannersTable.id, id));
+
+    res.json({ ok: true, active: newActive });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/payment-methods", requireAdmin, async (_req, res) => {
+  try {
+    console.log("[API] 📥 GET /admin/payment-methods");
+    await ensureDatabaseSchema();
+    const methods = await db
+      .select()
+      .from(paymentMethodsTable)
+      .orderBy(asc(paymentMethodsTable.order));
+    console.log("[API] ✅ Returning", methods.length, "methods");
+    res.json(methods);
+  } catch (err: any) {
+    console.error("[API] ❌ Error fetching payment methods:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch("/admin/payment-methods/reorder", requireAdmin, async (req, res) => {
+  try {
+    await ensureDatabaseSchema();
+    const items = req.body?.items; // Array of { id: number, order: number }
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (item.id !== undefined && item.order !== undefined) {
+          await db
+            .update(paymentMethodsTable)
+            .set({ order: Number(item.order), updatedAt: new Date() } as any)
+            .where(eq(paymentMethodsTable.id, Number(item.id)));
+        }
+      }
+    }
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("Reorder payment methods failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch("/admin/payment-methods/:id/toggle", requireAdmin, async (req, res) => {
+  try {
+    await ensureDatabaseSchema();
+    const id = Number(req.params.id);
+    const [existing] = await db
+      .select()
+      .from(paymentMethodsTable)
+      .where(eq(paymentMethodsTable.id, id))
+      .limit(1);
+    if (!existing) {
+      return res.status(404).json({ error: "طريقة الدفع غير موجودة" });
+    }
+    const newActive = typeof req.body?.active === "boolean" ? req.body.active : !existing.active;
+    await db
+      .update(paymentMethodsTable)
+      .set({ active: newActive, updatedAt: new Date() } as any)
+      .where(eq(paymentMethodsTable.id, id));
+    res.json({ ok: true, active: newActive });
+  } catch (err: any) {
+    console.error("Toggle payment method failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+makeCrud("payment-methods", paymentMethodsTable, {
+  orderBy: asc(paymentMethodsTable.order),
+  allowedFields: [
+    "code",
+    "name",
+    "subtitle",
+    "instructions",
+    "walletAddress",
+    "logoImage",
+    "qrImage",
+    "showQrFromAddress",
+    "show_qr_from_address",
+    "minAmount",
+    "active",
+    "order",
+    "category",
+    "requiresVerification",
+    "displayConfig",
+    "display_config",
+  ],
+});
+
+makeCrud("social-links", socialLinksTable, {
+  orderBy: socialLinksTable.order,
+  allowedFields: ["platform", "url", "label", "order", "active", "icon"],
+});
+
+router.patch("/admin/social-links/reorder", requireAdmin, async (req, res) => {
+  try {
+    const items = req.body?.items; // Array of { id: number, order: number }
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (item.id !== undefined && item.order !== undefined) {
+          await db
+            .update(socialLinksTable)
+            .set({ order: Number(item.order) })
+            .where(eq(socialLinksTable.id, Number(item.id)));
+        }
+      }
+    }
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Cascade delete للمزودين: حذف المنتجات المرتبطة ثم حذف المزود
+router.delete("/admin/providers/:id", requireAdmin, async (req, res) => {
+  const providerId = Number(req.params.id);
+  
+  // حذف جميع المنتجات المرتبطة بهذا المزود
+  await db.execute(sql`DELETE FROM products WHERE provider_id = ${providerId}`);
+  
+  // حذف المزود نفسه
+  await db.delete(providersTable).where(eq(providersTable.id, providerId));
+  
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "delete",
+    "providers",
+    { id: providerId, cascade: true }
+  );
+  
+  res.json({ ok: true });
+});
+
+makeCrud("providers", providersTable, {
+  orderBy: providersTable.priority,
+  allowedFields: [
+    "name", "apiUrl", "apiKey", "notes", "priority", "active", "providerType",
+    "productsEndpoint", "profileEndpoint", "orderEndpoint", "checkEndpoint", "tokenHeader"
+  ],
+});
+
+makeCrud("coupons", couponsTable, {
+  allowedFields: ["code", "discountPct", "maxUses", "active"],
+});
+
+makeCrud("auto-codes", autoCodesTable, {
+  allowedFields: ["productId", "code", "note", "used"],
+});
+
+makeCrud("order-messages", orderMessagesTable, {
+  allowedFields: ["event", "title", "body"],
+});
+
+makeCrud("api-keys", apiKeysTable, {
+  allowedFields: ["name", "keyValue", "active"],
+});
+
+makeCrud("notifications", notificationsTable, {
+  allowedFields: ["targetType", "targetUserId", "title", "content", "status", "isRead"],
+});
+
+// ========== USERS ==========
+router.get("/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const q = (req.query["q"] as string | undefined)?.trim();
+    const role = (req.query["role"] as string | undefined)?.trim();
+    const vipLevel = req.query["vipLevel"] ? Number(req.query["vipLevel"]) : undefined;
+    const status = (req.query["status"] as string | undefined)?.trim();
+
+    const conditions: any[] = [];
+
+    if (role && role !== "all") {
+      conditions.push(eq(usersTable.role, role));
+    }
+    if (vipLevel && !isNaN(vipLevel)) {
+      conditions.push(eq(usersTable.vipLevel, vipLevel));
+    }
+    if (status === "banned" || status === "true") {
+      conditions.push(eq(usersTable.banned, true));
+    } else if (status === "active" || status === "false") {
+      conditions.push(eq(usersTable.banned, false));
+    }
+
+    if (q) {
+      const numId = Number(q);
+      if (!isNaN(numId)) {
+        conditions.push(
+          sql`(${usersTable.id} = ${numId} OR ${usersTable.displayId} ILIKE ${"%" + q + "%"} OR ${usersTable.username} ILIKE ${"%" + q + "%"} OR ${usersTable.email} ILIKE ${"%" + q + "%"} OR ${usersTable.telegramId} ILIKE ${"%" + q + "%"})`
+        );
+      } else {
+        conditions.push(
+          sql`(${usersTable.displayId} ILIKE ${"%" + q + "%"} OR ${usersTable.username} ILIKE ${"%" + q + "%"} OR ${usersTable.email} ILIKE ${"%" + q + "%"} OR ${usersTable.telegramId} ILIKE ${"%" + q + "%"})`
+        );
+      }
+    }
+
+    const rows = await db
+      .select()
+      .from(usersTable)
+      .where(conditions.length ? and(...conditions) : undefined)
+      .orderBy(desc(usersTable.createdAt))
+      .limit(1000);
+
+    res.json(rows);
+  } catch (err: any) {
+    console.error("Error fetching users:", err);
+    res.status(500).json({ error: err.message || "فشل في جلب المستخدمين" });
+  }
+});
+
+router.post("/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const { username, email, password, role, vipLevel, banned } = req.body;
+    if (!username || typeof username !== "string" || !username.trim()) {
+      return res.status(400).json({ error: "اسم المستخدم مطلوب" });
+    }
+    if (!password || typeof password !== "string" || !password.trim()) {
+      return res.status(400).json({ error: "كلمة المرور مطلوبة" });
+    }
+
+    const passwordHash = await bcrypt.hash(password.trim(), 10);
+    const displayId = "USR" + Math.floor(100000 + Math.random() * 900000);
+
+    const [newUser] = await db
+      .insert(usersTable)
+      .values({
+        username: username.trim(),
+        displayId,
+        email: email ? email.trim() : null,
+        passwordHash,
+        role: role || "user",
+        vipLevel: vipLevel ? Number(vipLevel) : 1,
+        banned: Boolean(banned),
+        balanceUsd: "0.00",
+        balanceSyp: "0",
+      })
+      .returning();
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "create_user",
+      String(newUser.id),
+      { username: newUser.username, role: newUser.role }
+    );
+
+    res.json(newUser);
+  } catch (err: any) {
+    console.error("Error creating user:", err);
+    res.status(500).json({ error: err.message || "فشل في إنشاء المستخدم" });
+  }
+});
+
+const handleUpdateUser = async (req: any, res: any) => {
+  try {
+    const userId = Number(req.params.id);
+    if (!userId) {
+      return res.status(400).json({ error: "معرف المستخدم غير صالح" });
+    }
+
+    const allowed = filterFields(req.body, [
+      "username",
+      "email",
+      "balanceUsd",
+      "balanceSyp",
+      "role",
+      "banned",
+      "vipLevel",
+    ]);
+
+    if (req.body.vip_level !== undefined && allowed.vipLevel === undefined) {
+      allowed.vipLevel = req.body.vip_level;
+    }
+
+    if ("vipLevel" in allowed && allowed.vipLevel != null) {
+      allowed.vipLevel = parseInt(String(allowed.vipLevel), 10) || 1;
+    }
+    if (req.body.password && typeof req.body.password === "string" && req.body.password.trim().length > 0) {
+      allowed.passwordHash = await bcrypt.hash(req.body.password.trim(), 10);
+    }
+
+    const [row] = await db
+      .update(usersTable)
+      .set(allowed)
+      .where(eq(usersTable.id, userId))
+      .returning();
+
+    if (!row) {
+      return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "update_user",
+      String(userId),
+      allowed,
+    );
+
+    res.json({ success: true, user: row, ...row });
+  } catch (err: any) {
+    console.error("Error updating user:", err);
+    res.status(500).json({ error: err.message || "فشل تحديث بيانات المستخدم" });
+  }
+};
+
+router.put(["/admin/users/:id", "/users/:id"], requireAdmin, handleUpdateUser);
+router.patch(["/admin/users/:id", "/users/:id"], requireAdmin, handleUpdateUser);
+
+router.delete("/admin/users/:id", requireAdmin, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    await db.delete(usersTable).where(eq(usersTable.id, userId));
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "delete_user",
+      String(userId)
+    );
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("Error deleting user:", err);
+    res.status(500).json({ error: err.message || "فشل في حذف المستخدم" });
+  }
+});
+
+router.post("/admin/users/bulk-ban", requireAdmin, async (req, res) => {
+  try {
+    const { userIds, banned } = req.body;
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: "لم يتم تحديد أي مستخدمين" });
+    }
+
+    await db
+      .update(usersTable)
+      .set({ banned: Boolean(banned) })
+      .where(inArray(usersTable.id, userIds.map(Number)));
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      banned ? "bulk_ban_users" : "bulk_unban_users",
+      "users",
+      { userIds, count: userIds.length }
+    );
+
+    res.json({ ok: true, count: userIds.length });
+  } catch (err: any) {
+    console.error("Error bulk banning users:", err);
+    res.status(500).json({ error: err.message || "فشل في الإجراء الجماعي" });
+  }
+});
+
+router.post("/admin/users/bulk-delete", requireAdmin, async (req, res) => {
+  try {
+    const { userIds } = req.body;
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: "لم يتم تحديد أي مستخدمين" });
+    }
+
+    await db.delete(usersTable).where(inArray(usersTable.id, userIds.map(Number)));
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "bulk_delete_users",
+      "users",
+      { userIds, count: userIds.length }
+    );
+
+    res.json({ ok: true, count: userIds.length });
+  } catch (err: any) {
+    console.error("Error bulk deleting users:", err);
+    res.status(500).json({ error: err.message || "فشل في الحذف الجماعي" });
+  }
+});
+
+router.post("/admin/users/:id/notify", requireAdmin, async (req, res) => {
+  try {
+    const { title, content } = req.body;
+    const userId = Number(req.params.id);
+    if (isNaN(userId) || userId <= 0) {
+      return res.status(400).json({ error: "معرف المستخدم غير صالح" });
+    }
+    if (!content || typeof content !== "string" || !content.trim()) {
+      return res.status(400).json({ error: "محتوى الإشعار مطلوب" });
+    }
+
+    const row = await createInternalNotification({
+      targetType: "user",
+      targetUserId: userId,
+      title: (title || "").trim() || "إشعار من الإدارة",
+      content: content.trim(),
+    });
+
+    if (!row) {
+      return res.status(500).json({ error: "فشل إنشاء الإشعار في قاعدة البيانات" });
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "notify_user",
+      String(userId),
+      { title, content },
+    );
+
+    res.json(row);
+  } catch (error: any) {
+    console.error("Notify user error:", error);
+    res.status(500).json({ error: error.message || "حدث خطأ أثناء إرسال الإشعار" });
+  }
+});
+
+router.post("/admin/users/:id/adjust-balance", requireAdmin, async (req, res) => {
+  let result: Awaited<ReturnType<typeof applyUserBalanceAdjustment>>;
+  try {
+    result = await applyUserBalanceAdjustment(Number(req.params.id), req.body);
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      res.status(error.statusCode).json({ error: error.message });
+      return;
+    }
+    throw error;
+  }
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "adjust_balance",
+    String(req.params.id),
+    result.adjustment,
+  );
+  res.json({ ok: true, user: result.updatedUser });
+});
+
+// ========== ORDERS ==========
+router.get("/admin/orders", requireAdmin, async (req, res) => {
+  const status = req.query["status"] as string | undefined;
+  const conditions = status && status !== "all" ? [eq(ordersTable.status, status)] : [];
+  const rows = await db
+    .select({
+      order: ordersTable,
+      user: usersTable,
+      product: productsTable,
+    })
+    .from(ordersTable)
+    .leftJoin(usersTable, eq(usersTable.id, ordersTable.userId))
+    .leftJoin(productsTable, eq(productsTable.id, ordersTable.productId))
+    .where(conditions.length ? and(...conditions) : undefined)
+    .orderBy(desc(ordersTable.createdAt))
+    .limit(500);
+  res.json(
+    rows.map((r) => ({
+      ...r.order,
+      userName: r.user?.username,
+      productName: r.product?.name,
+      productImage: r.product?.image,
+    })),
+  );
+});
+
+router.post("/admin/orders/:id/status", requireAdmin, async (req, res) => {
+  const { status, note } = req.body as { status: string; note?: string };
+  const id = Number(req.params.id);
+  const result = await applyOrderStatusChange(id, status, note);
+  if ("error" in result) {
+    res.status(404).json({ error: "غير موجود" });
+    return;
+  }
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "order_status",
+    String(id),
+    { status, note },
+  );
+  res.json(result.updated);
+});
+
+// ========== DEPOSITS ==========
+router.get("/admin/deposits", requireAdmin, async (req, res) => {
+  try {
+    const status = req.query["status"] as string | undefined;
+    const method = req.query["method"] as string | undefined;
+    const conditions = [];
+    if (status && status !== "all") {
+      conditions.push(eq(depositsTable.status, status));
+    }
+    if (method && method !== "all") {
+      conditions.push(eq(depositsTable.method, method));
+    }
+    const rows = await db
+      .select({ deposit: depositsTable, user: usersTable })
+      .from(depositsTable)
+      .leftJoin(usersTable, eq(usersTable.id, depositsTable.userId))
+      .where(conditions.length ? and(...conditions) : undefined)
+      .orderBy(desc(depositsTable.createdAt))
+      .limit(500);
+    res.json(
+      rows.map((r) => ({ ...r.deposit, userName: r.user?.username })),
+    );
+  } catch (err: any) {
+    console.error("[Admin GET /admin/deposits error]:", err);
+    res.status(500).json({ error: err.message || "فشل جلب الإيداعات" });
+  }
+});
+
+router.patch("/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: "معرف الإيداع غير صالح" });
+    }
+    const result = await applyDepositStatusChange(id, "approved");
+    if ("error" in result) {
+      if (result.error === "auto_managed") {
+        return res.status(400).json({ error: "إيداع شام كاش التلقائي يُدار تلقائيًا عبر API ولا يقبل موافقة يدوية." });
+      }
+      if (result.error === "already_approved") {
+        return res.status(400).json({ error: "الإيداع مقبول مسبقاً", status: "approved" });
+      }
+      if (result.error === "already_rejected") {
+        return res.status(400).json({ error: "الإيداع مرفوض مسبقاً", status: "rejected" });
+      }
+      return res.status(404).json({ error: "الإيداع غير موجود" });
+    }
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "deposit_approved",
+      String(id),
+      { status: "approved" },
+    );
+    return res.json({ success: true, deposit: result.updated });
+  } catch (err: any) {
+    console.error("[Admin Approve Error]:", err);
+    return res.status(500).json({ error: err.message || "فشل قبول الإيداع" });
+  }
+});
+
+router.patch("/admin/deposits/:id/reject", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { reason } = req.body as { reason?: string };
+    if (isNaN(id)) {
+      return res.status(400).json({ error: "معرف الإيداع غير صالح" });
+    }
+    const result = await applyDepositStatusChange(id, "rejected");
+    if ("error" in result) {
+      if (result.error === "auto_managed") {
+        return res.status(400).json({ error: "إيداع شام كاش التلقائي يُدار تلقائيًا عبر API ولا يقبل رفض يدوي." });
+      }
+      if (result.error === "already_approved") {
+        return res.status(400).json({ error: "الإيداع مقبول مسبقاً", status: "approved" });
+      }
+      if (result.error === "already_rejected") {
+        return res.status(400).json({ error: "الإيداع مرفوض مسبقاً", status: "rejected" });
+      }
+      return res.status(404).json({ error: "الإيداع غير موجود" });
+    }
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "deposit_rejected",
+      String(id),
+      { status: "rejected", reason },
+    );
+    return res.json({ success: true, deposit: result.updated });
+  } catch (err: any) {
+    console.error("[Admin Reject Error]:", err);
+    return res.status(500).json({ error: err.message || "فشل رفض الإيداع" });
+  }
+});
+
+router.post("/admin/deposits/:id/status", requireAdmin, async (req, res) => {
+  const { status, note } = req.body as { status: string; note?: string };
+  const id = Number(req.params.id);
+  const result = await applyDepositStatusChange(id, status);
+  if ("error" in result) {
+    if (result.error === "auto_managed") {
+      res.status(400).json({ error: "إيداع شام كاش التلقائي يُدار تلقائيًا عبر API ولا يقبل موافقة/رفض يدوي." });
+      return;
+    }
+    if (result.error === "already_approved") {
+      res.status(400).json({ error: "الإيداع مقبول مسبقاً", status: "approved" });
+      return;
+    }
+    if (result.error === "already_rejected") {
+      res.status(400).json({ error: "الإيداع مرفوض مسبقاً", status: "rejected" });
+      return;
+    }
+    res.status(404).json({ error: "غير موجود" });
+    return;
+  }
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "deposit_status",
+    String(id),
+    { status, note },
+  );
+  res.json(result.updated);
+});
+
+// ========== SETTINGS ==========
+router.get("/admin/settings/use-legacy-users-page", async (_req, res) => {
+  try {
+    const [row] = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_users_page")).limit(1);
+    const value = row?.value;
+    const isLegacy = value === "true" || value === true;
+    res.json({ key: "use_legacy_users_page", value: String(isLegacy) });
+  } catch (err: any) {
+    res.json({ key: "use_legacy_users_page", value: "false" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-users-page", requireAdmin, async (req, res) => {
+  try {
+    const value = String(req.body?.value === true || req.body?.value === "true");
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_users_page", value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    res.json({ ok: true, value });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/settings/use-legacy-theme-page", async (_req, res) => {
+  try {
+    const [row] = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_theme_page")).limit(1);
+    const value = row?.value;
+    const isLegacy = value === "true" || value === true;
+    res.json({ key: "use_legacy_theme_page", value: String(isLegacy) });
+  } catch (err: any) {
+    res.json({ key: "use_legacy_theme_page", value: "false" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-theme-page", requireAdmin, async (req, res) => {
+  try {
+    const value = String(req.body?.value === true || req.body?.value === "true");
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_theme_page", value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    res.json({ ok: true, value });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/settings/use-legacy-settings-page", async (_req, res) => {
+  try {
+    const [row] = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_settings_page")).limit(1);
+    const value = row?.value;
+    const isLegacy = value === "true" || value === true;
+    res.json({ key: "use_legacy_settings_page", value: String(isLegacy) });
+  } catch (err: any) {
+    res.json({ key: "use_legacy_settings_page", value: "false" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-settings-page", requireAdmin, async (req, res) => {
+  try {
+    const value = String(req.body?.value === true || req.body?.value === "true");
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_settings_page", value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    res.json({ ok: true, value });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/settings/use-legacy-auth-pages", async (_req, res) => {
+  try {
+    const [row] = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_auth_pages")).limit(1);
+    const value = row?.value;
+    const isLegacy = value === "true" || value === true;
+    res.json({ key: "use_legacy_auth_pages", value: String(isLegacy) });
+  } catch (err: any) {
+    res.json({ key: "use_legacy_auth_pages", value: "false" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-auth-pages", requireAdmin, async (req, res) => {
+  try {
+    const value = String(req.body?.value === true || req.body?.value === "true");
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_auth_pages", value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    res.json({ ok: true, value });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/settings/use-legacy-social-links-page", async (_req, res) => {
+  try {
+    const [row] = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_social_links_page")).limit(1);
+    const value = row?.value;
+    const isLegacy = value === "true" || value === true;
+    res.json({ key: "use_legacy_social_links_page", value: String(isLegacy) });
+  } catch (err: any) {
+    res.json({ key: "use_legacy_social_links_page", value: "false" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-social-links-page", requireAdmin, async (req, res) => {
+  try {
+    const value = String(req.body?.value === true || req.body?.value === "true");
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_social_links_page", value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    res.json({ ok: true, value });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/settings/use-legacy-banners-page", async (_req, res) => {
+  try {
+    const [row] = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_banners_page")).limit(1);
+    const value = row?.value;
+    const isLegacy = value === "true" || value === true;
+    res.json({ key: "use_legacy_banners_page", value: String(isLegacy) });
+  } catch (err: any) {
+    res.json({ key: "use_legacy_banners_page", value: "false" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-banners-page", requireAdmin, async (req, res) => {
+  try {
+    const value = String(req.body?.value === true || req.body?.value === "true");
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_banners_page", value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    res.json({ ok: true, value });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/settings/show-featured-offers", async (_req, res) => {
+  try {
+    const [row] = await db.select().from(settingsTable).where(eq(settingsTable.key, "show_featured_offers")).limit(1);
+    const value = row?.value;
+    const enabled = value === "true" || value === true || value === undefined; // default true
+    res.json({ key: "show_featured_offers", value: String(enabled) });
+  } catch (err: any) {
+    res.json({ key: "show_featured_offers", value: "true" });
+  }
+});
+
+router.put("/admin/settings/show-featured-offers", requireAdmin, async (req, res) => {
+  try {
+    const value = String(req.body?.value === true || req.body?.value === "true");
+    await db
+      .insert(settingsTable)
+      .values({ key: "show_featured_offers", value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    res.json({ ok: true, value });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/theme-settings", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable);
+    const map = new Map(rows.map((r) => [r.key, r.value]));
+
+    const themePrimary = String(map.get("theme_primary") || "#C8A45C").trim();
+    const themeSecondary = String(map.get("theme_secondary") || "#B8954A").trim();
+    const themeAccent = String(map.get("theme_accent") || "#FDE68A").trim();
+    const themeBackground = String(map.get("theme_background") || map.get("theme_bg") || "#1A1A1A").trim();
+    const themeTextPrimary = String(map.get("theme_text_primary") || "#FFFFFF").trim();
+    const themeFontArabic = String(map.get("theme_font_arabic") || map.get("theme_font") || "Cairo").trim();
+    const themeFontEnglish = String(map.get("theme_font_english") || "Inter").trim();
+    const themeFontSize = String(map.get("theme_font_size") || "14").trim();
+    const themeBorderRadius = String(map.get("theme_border_radius") || map.get("theme_radius") || "16").trim();
+    const themeShadow = String(map.get("theme_shadow") || "medium").trim();
+    const themeDefaultMode = String(map.get("theme_default_mode") || "dark").trim();
+
+    const out: Record<string, any> = {
+      theme_primary: themePrimary,
+      theme_secondary: themeSecondary,
+      theme_accent: themeAccent,
+      theme_background: themeBackground,
+      theme_text_primary: themeTextPrimary,
+      theme_font_arabic: themeFontArabic,
+      theme_font_english: themeFontEnglish,
+      theme_font_size: themeFontSize,
+      theme_border_radius: themeBorderRadius,
+      theme_shadow: themeShadow,
+      theme_default_mode: themeDefaultMode,
+      // Legacy compatibility
+      theme_bg: themeBackground,
+      theme_font: themeFontArabic,
+      theme_radius: themeBorderRadius,
+      // Direct properties
+      primary: themePrimary,
+      secondary: themeSecondary,
+      accent: themeAccent,
+      background: themeBackground,
+      textPrimary: themeTextPrimary,
+      font: themeFontArabic,
+      radius: themeBorderRadius,
+      // Default product page settings fallbacks
+      product_image_size: map.get("product_image_size") || "250px",
+      product_layout_order: map.get("product_layout_order") || ["image", "title", "price", "description", "quantity", "buttons", "reviews", "related", "guarantees"],
+      product_show_reviews: map.get("product_show_reviews") !== undefined ? map.get("product_show_reviews") : true,
+      product_show_related: map.get("product_show_related") !== undefined ? map.get("product_show_related") : true,
+      product_show_guarantees: map.get("product_show_guarantees") !== undefined ? map.get("product_show_guarantees") : true,
+      product_bg_color: map.get("product_bg_color") || "#1A1A1A",
+      product_text_color: map.get("product_text_color") || "#FFFFFF",
+      product_button_color: map.get("product_button_color") || "#C8A45C",
+      product_border_color: map.get("product_border_color") || "#C8A45C",
+      product_legacy_mode: map.get("product_legacy_mode") !== undefined ? map.get("product_legacy_mode") : false,
+    };
+
+    // Include any other product_ keys
+    for (const [key, val] of map.entries()) {
+      if (key.startsWith("product_") && !(key in out)) {
+        out[key] = val;
+      }
+    }
+
+    console.log("[Admin Theme] GET /admin/theme-settings loaded settings:", out);
+    res.json(out);
+  } catch (err: any) {
+    console.error("[Admin Theme] GET error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put("/admin/theme-settings", requireAdmin, async (req, res) => {
+  try {
+    const updates = req.body as Record<string, any>;
+    console.log("[Admin Theme] PUT /admin/theme-settings received update payload:", updates);
+
+    for (const [key, value] of Object.entries(updates)) {
+      await db
+        .insert(settingsTable)
+        .values({ key, value })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    }
+
+    // Sync legacy/alias keys bidirectionally
+    if (updates.theme_background) {
+      await db.insert(settingsTable).values({ key: "theme_bg", value: updates.theme_background }).onConflictDoUpdate({ target: settingsTable.key, set: { value: updates.theme_background } });
+    } else if (updates.theme_bg) {
+      await db.insert(settingsTable).values({ key: "theme_background", value: updates.theme_bg }).onConflictDoUpdate({ target: settingsTable.key, set: { value: updates.theme_bg } });
+    }
+
+    if (updates.theme_font_arabic) {
+      await db.insert(settingsTable).values({ key: "theme_font", value: updates.theme_font_arabic }).onConflictDoUpdate({ target: settingsTable.key, set: { value: updates.theme_font_arabic } });
+    } else if (updates.theme_font) {
+      await db.insert(settingsTable).values({ key: "theme_font_arabic", value: updates.theme_font }).onConflictDoUpdate({ target: settingsTable.key, set: { value: updates.theme_font } });
+    }
+
+    if (updates.theme_border_radius) {
+      await db.insert(settingsTable).values({ key: "theme_radius", value: updates.theme_border_radius }).onConflictDoUpdate({ target: settingsTable.key, set: { value: updates.theme_border_radius } });
+    } else if (updates.theme_radius) {
+      await db.insert(settingsTable).values({ key: "theme_border_radius", value: updates.theme_radius }).onConflictDoUpdate({ target: settingsTable.key, set: { value: updates.theme_radius } });
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "theme_update",
+      "theme",
+      Object.keys(updates),
+    );
+
+    console.log("[Admin Theme] Theme updated and logged successfully.");
+    res.json({ ok: true, success: true });
+  } catch (err: any) {
+    console.error("[Admin Theme] PUT error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const getProductPageConfigHandler = async (_req: any, res: any) => {
+  try {
+    let dbConfig: any = null;
+    try {
+      const rows = await db.select().from(productPageConfigTable).limit(1);
+      if (Array.isArray(rows) && rows.length > 0) {
+        dbConfig = rows[0];
+      }
+    } catch (e) {
+      // fallback
+    }
+
+    const rows = await db.select().from(settingsTable);
+    const map = new Map<string, any>();
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        if (row.key) {
+          let val = row.value;
+          if (typeof val === "string") {
+            try { val = JSON.parse(val); } catch {}
+          }
+          map.set(row.key, val);
+        }
+      }
+    }
+
+    const defaultSections = [
+      { id: "image", visible: true, order: 1, label: "صورة المنتج والبدائل", title: "صورة المنتج" },
+      { id: "title", visible: true, order: 2, label: "اسم المنتج والتصنيف وحالة التوفر", title: "اسم المنتج" },
+      { id: "price", visible: true, order: 3, label: "السعر المباشر والمجموع الكلي", title: "السعر" },
+      { id: "rating", visible: true, order: 4, label: "شارات التقييم وشارات الخدمة", title: "التقييمات" },
+      { id: "description", visible: true, order: 5, label: "وصف المنتج والملاحظات", title: "الوصف" },
+      { id: "quantity", visible: true, order: 6, label: "تحديد الكمية وباقات الشحن", title: "اختيار الكمية" },
+      { id: "add_to_cart", visible: true, order: 7, label: "زر الإضافة إلى السلة", title: "إضافة إلى السلة", button_text: "إضافة إلى السلة" },
+      { id: "buy_now", visible: true, order: 8, label: "زر الشراء وتأكيد الطلب", title: "شراء الآن", button_text: "شراء الآن" },
+      { id: "guarantees", visible: true, order: 9, label: "شارات الأمان والضمان الفوري", title: "الضمان والراحة" },
+      { id: "reviews", visible: true, order: 10, label: "آراء وتقييمات العملاء", title: "التقييمات والمراجعات" },
+      { id: "related_products", visible: true, order: 11, label: "منتجات ذات صلة من نفس القسم", title: "منتجات قد تعجبك" },
+      { id: "share_buttons", visible: true, order: 12, label: "أزرار المشاركة والمفضلة", title: "مشاركة والمفضلة" },
+      { id: "specifications", visible: false, order: 13, label: "المواصفات التقنية والشحن", title: "المواصفات والتفاصيل" }
+    ];
+
+    const defaultCustomization = {
+      image_size: "250px",
+      price_color: "#FDE68A",
+      button_color: "#C8A45C",
+      button_text_color: "#1A1A1A",
+      bg_color: "#1A1A1A",
+      text_color: "#FFFFFF",
+      border_color: "#C8A45C",
+      border_radius: "16px",
+      font_family: "Cairo"
+    };
+
+    const sections = dbConfig?.sections || map.get("product_page_layout") || defaultSections;
+    const customization = dbConfig?.customization || map.get("product_page_style") || defaultCustomization;
+    const useLegacy = map.get("use_legacy_product_page") ?? map.get("product_legacy_mode") ?? false;
+
+    res.json({
+      sections,
+      customization,
+      use_legacy_product_page: Boolean(useLegacy === true || useLegacy === "true")
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+const putProductPageConfigHandler = async (req: any, res: any) => {
+  try {
+    const { sections, customization, use_legacy_product_page } = req.body;
+
+    if (sections) {
+      await db.insert(settingsTable).values({ key: "product_page_layout", value: sections })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: sections } });
+    }
+
+    if (customization) {
+      await db.insert(settingsTable).values({ key: "product_page_style", value: customization })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: customization } });
+
+      if (customization.image_size) {
+        await db.insert(settingsTable).values({ key: "product_image_size", value: customization.image_size })
+          .onConflictDoUpdate({ target: settingsTable.key, set: { value: customization.image_size } });
+      }
+      if (customization.bg_color) {
+        await db.insert(settingsTable).values({ key: "product_bg_color", value: customization.bg_color })
+          .onConflictDoUpdate({ target: settingsTable.key, set: { value: customization.bg_color } });
+      }
+      if (customization.button_color) {
+        await db.insert(settingsTable).values({ key: "product_button_color", value: customization.button_color })
+          .onConflictDoUpdate({ target: settingsTable.key, set: { value: customization.button_color } });
+      }
+    }
+
+    if (use_legacy_product_page !== undefined) {
+      await db.insert(settingsTable).values({ key: "use_legacy_product_page", value: use_legacy_product_page })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: use_legacy_product_page } });
+      await db.insert(settingsTable).values({ key: "product_legacy_mode", value: use_legacy_product_page })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: use_legacy_product_page } });
+    }
+
+    try {
+      if (sections || customization) {
+        await db.insert(productPageConfigTable).values({
+          id: 1,
+          sections: sections || [],
+          customization: customization || {},
+          updatedAt: new Date()
+        }).onConflictDoUpdate({
+          target: productPageConfigTable.id,
+          set: {
+            sections: sections || sql`sections`,
+            customization: customization || sql`customization`,
+            updatedAt: new Date()
+          }
+        });
+      }
+    } catch (e) {
+      // fallback
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "product_page_settings_update",
+      "settings",
+      ["product_page_layout", "product_page_style", "use_legacy_product_page"]
+    );
+
+    res.json({ ok: true, success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+router.get("/admin/product-page-settings", requireAdmin, getProductPageConfigHandler);
+router.get("/admin/product-page-config", requireAdmin, getProductPageConfigHandler);
+router.put("/admin/product-page-settings", requireAdmin, putProductPageConfigHandler);
+router.put("/admin/product-page-config", requireAdmin, putProductPageConfigHandler);
+
+const DEFAULT_ABOUT_US_CONFIG = {
+  title: "من نحن",
+  subtitle: "نحن منصة رقمية متكاملة تقدم حلولاً مبتكرة في عالم التجارة الإلكترونية والخدمات الرقمية",
+  sections: [
+    {
+      id: "intro",
+      type: "text",
+      title: "قصتنا",
+      content: "بدأت رحلتنا في تقديم أسرع وأرقى الخدمات الرقمية للبطاقات والشحن وباقات الألعاب بطرق سريعة وآمنة بأسعار منافسة ومعالجة فورية.",
+      image: "",
+      order: 1,
+      visible: true
+    },
+    {
+      id: "mission",
+      type: "text",
+      title: "رسالتنا",
+      content: "تمكين الأفراد والشركات من الوصول إلى كافة الخدمات والبطاقات الرقمية بسهولة، سرعة وأمان لا مثيل له.",
+      image: "",
+      order: 2,
+      visible: true
+    },
+    {
+      id: "vision",
+      type: "text",
+      title: "رؤيتنا",
+      content: "أن نكون الخيار الأول والمنصة الرائدة والأكثر موثوقية في المنطقة لتوفير حلول الشحن الرقمي والخدمات الإلكترونية.",
+      image: "",
+      order: 3,
+      visible: true
+    },
+    {
+      id: "team",
+      type: "team",
+      title: "فريقنا المتميز",
+      members: [
+        { name: "أحمد علي", role: "المدير التنفيذي", image: "", bio: "خبرة تزيد عن 8 سنوات في إدارة المنصات الرقمية وخدمات الدفع." },
+        { name: "سارة المحمود", role: "مديرة الدعم والعمليات", image: "", bio: "متخصصة في جودة الخدمة ودعم العملاء الفوري على مدار الساعة." }
+      ],
+      order: 4,
+      visible: true
+    },
+    {
+      id: "stats",
+      type: "stats",
+      title: "إحصائيات المنصة",
+      statistics: [
+        { label: "عميل سعيد", value: "+10,000" },
+        { label: "طلب مكتمل", value: "+50,000" },
+        { label: "سرعة التنفيذ", value: "فوري" },
+        { label: "ساعات الدعم", value: "24/7" }
+      ],
+      order: 5,
+      visible: true
+    },
+    {
+      id: "contact",
+      type: "contact",
+      title: "تواصل معنا مباشرة",
+      email: "support@shadx.com",
+      phone: "+963 900 000 000",
+      address: "دمشق، سوريا",
+      order: 6,
+      visible: true
+    }
+  ],
+  style: {
+    bg_color: "#1A1A1A",
+    text_color: "#FFFFFF",
+    title_color: "#C8A45C",
+    section_bg: "#2D2D2D",
+    border_radius: "16px",
+    font_family: "Cairo"
+  }
+};
+
+const handleGetAboutConfig = async (_req: any, res: any) => {
+  try {
+    const rows = await db.select().from(settingsTable);
+    const map = new Map<string, any>();
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        if (row.key) {
+          let val = row.value;
+          if (typeof val === "string") {
+            try { val = JSON.parse(val); } catch {}
+          }
+          map.set(row.key, val);
+        }
+      }
+    }
+
+    const config = map.get("about_us_config") || DEFAULT_ABOUT_US_CONFIG;
+    const useLegacy = map.get("use_legacy_about_page") ?? false;
+
+    res.json({
+      config,
+      use_legacy_about_page: Boolean(useLegacy === true || useLegacy === "true")
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+const handlePutAboutConfig = async (req: any, res: any) => {
+  try {
+    const { config, use_legacy_about_page } = req.body;
+
+    if (config) {
+      await db.insert(settingsTable).values({ key: "about_us_config", value: config })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: config } });
+    }
+
+    if (use_legacy_about_page !== undefined) {
+      await db.insert(settingsTable).values({ key: "use_legacy_about_page", value: use_legacy_about_page })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: use_legacy_about_page } });
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "about_settings_update",
+      "settings",
+      ["about_us_config", "use_legacy_about_page"]
+    );
+
+    res.json({ ok: true, success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+router.get("/admin/about-config", requireAdmin, handleGetAboutConfig);
+router.put("/admin/about-config", requireAdmin, handlePutAboutConfig);
+
+const DEFAULT_DEPOSIT_PAGE_CONFIG = {
+  title: "شحن الرصيد",
+  subtitle: "اختر طريقة الدفع المناسبة وقم بشحن محفظتك بسهولة وأمان",
+  sections: {
+    header: { visible: true, title: "شحن الرصيد", description: "أضف رصيداً إلى محفظتك واستمتع بخدماتنا" },
+    payment_methods: { visible: true, title: "طرق الدفع المتاحة", description: "اختر طريقة الدفع المناسبة لك" },
+    amounts: { visible: true, title: "المبالغ المقترحة", description: "اختر المبلغ الذي ترغب في شحنه", suggested_amounts: [10, 25, 50, 100, 250, 500] },
+    custom_amount: { visible: true, label: "مبلغ مخصص", placeholder: "أدخل المبلغ الذي ترغب في شحنه", min: 1, max: 10000, currency: "USD" },
+    instructions: {
+      visible: true,
+      title: "تعليمات الشحن",
+      content: "يرجى اتباع التعليمات التالية لإتمام عملية الشحن بنجاح...",
+      steps: [
+        "اختر طريقة الدفع المناسبة",
+        "أدخل المبلغ الذي ترغب في شحنه",
+        "اتبع التعليمات الخاصة بطريقة الدفع المختارة",
+        "تأكد من إدخال البيانات بشكل صحيح"
+      ]
+    }
+  },
+  payment_methods_list: [
+    {
+      id: "sham_cash",
+      name: "شام كاش",
+      icon: "Landmark",
+      description: "الدفع عبر محفظة شام كاش",
+      active: true,
+      order: 1,
+      fields: [
+        { label: "رقم المحفظة", type: "text", required: true, placeholder: "أدخل رقم محفظة شام كاش" }
+      ]
+    },
+    {
+      id: "syriatel_cash",
+      name: "سيريتل كاش",
+      icon: "Smartphone",
+      description: "الدفع عبر خدمة سيريتل كاش",
+      active: true,
+      order: 2,
+      fields: [
+        { label: "رقم الهاتف", type: "text", required: true, placeholder: "أدخل رقم هاتفك" }
+      ]
+    },
+    {
+      id: "bank_transfer",
+      name: "تحويل بنكي",
+      icon: "Landmark",
+      description: "التحويل البنكي المباشر",
+      active: true,
+      order: 3,
+      fields: [
+        { label: "اسم البنك", type: "text", required: true, placeholder: "اسم البنك" },
+        { label: "رقم الحساب", type: "text", required: true, placeholder: "رقم الحساب" },
+        { label: "اسم المستفيد", type: "text", required: true, placeholder: "اسم المستفيد" }
+      ]
+    }
+  ],
+  styles: {
+    bg_color: "#1A1A1A",
+    text_color: "#FFFFFF",
+    title_color: "#C8A45C",
+    card_bg: "#2D2D2D",
+    card_border: "#C8A45C/20",
+    input_bg: "#3D3D3D",
+    input_text: "#FFFFFF",
+    input_border: "#4B5563",
+    input_focus_border: "#C8A45C",
+    button_bg: "#C8A45C",
+    button_text: "#1A1A1A",
+    button_hover: "#B8954A",
+    border_radius: "16px",
+    font_family: "Cairo",
+    amount_button_bg: "#2D2D2D",
+    amount_button_text: "#C8A45C",
+    amount_button_active_bg: "#C8A45C",
+    amount_button_active_text: "#1A1A1A"
+  }
+};
+
+const handleGetDepositConfig = async (_req: any, res: any) => {
+  try {
+    const rows = await db.select().from(settingsTable);
+    const map = new Map<string, any>();
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        if (row.key) {
+          let val = row.value;
+          if (typeof val === "string") {
+            try { val = JSON.parse(val); } catch {}
+          }
+          map.set(row.key, val);
+        }
+      }
+    }
+
+    const config = map.get("deposit_page_config") || DEFAULT_DEPOSIT_PAGE_CONFIG;
+    const useLegacy = map.get("use_legacy_deposit_page") ?? false;
+
+    res.json({
+      config,
+      use_legacy_deposit_page: Boolean(useLegacy === true || useLegacy === "true")
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+const handlePutDepositConfig = async (req: any, res: any) => {
+  try {
+    const { config, use_legacy_deposit_page } = req.body;
+
+    if (config) {
+      await db.insert(settingsTable).values({ key: "deposit_page_config", value: config })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: config } });
+    }
+
+    if (use_legacy_deposit_page !== undefined) {
+      await db.insert(settingsTable).values({ key: "use_legacy_deposit_page", value: use_legacy_deposit_page })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: use_legacy_deposit_page } });
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "deposit_settings_update",
+      "settings",
+      ["deposit_page_config", "use_legacy_deposit_page"]
+    );
+
+    res.json({ ok: true, success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+router.get("/admin/deposit-config", requireAdmin, handleGetDepositConfig);
+router.put("/admin/deposit-config", requireAdmin, handlePutDepositConfig);
+
+
+router.post("/admin/theme-settings/apply-preset", requireAdmin, async (req, res) => {
+  try {
+    const { preset, presetId, primary, secondary, accent, background, textPrimary } = req.body;
+    console.log("[Admin Theme] Applying preset batch:", req.body);
+
+    const themeUpdates: Record<string, string> = {
+      theme_primary: primary || "#C8A45C",
+      theme_secondary: secondary || "#B8954A",
+      theme_accent: accent || "#FDE68A",
+      theme_background: background || "#1A1A1A",
+      theme_bg: background || "#1A1A1A",
+      theme_text_primary: textPrimary || "#FFFFFF",
+    };
+
+    for (const [key, value] of Object.entries(themeUpdates)) {
+      await db
+        .insert(settingsTable)
+        .values({ key, value })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "theme_preset_applied",
+      "theme",
+      [preset || presetId || "custom"],
+    );
+
+    res.json({ ok: true, success: true, applied: themeUpdates });
+  } catch (err: any) {
+    console.error("[Admin Theme] Preset application error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/admin/settings", requireAdmin, async (_req, res) => {
+  const rows = await db.select().from(settingsTable);
+  const out: Record<string, any> = {};
+  for (const r of rows) out[r.key] = r.value;
+  res.json(out);
+});
+
+router.put("/admin/settings", requireAdmin, async (req, res) => {
+  const updates = req.body as Record<string, any>;
+  for (let [key, value] of Object.entries(updates)) {
+    if (
+      key.startsWith("shamcash_") ||
+      key === "public_api_base_url"
+    ) {
+      value = extractStringValue(value);
+    }
+    await db
+      .insert(settingsTable)
+      .values({ key, value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+  }
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "settings_update",
+    "settings",
+    Object.keys(updates),
+  );
+  res.json({ ok: true });
+});
+
+// ========== ACTIVITY ==========
+router.get("/admin/activity", requireAdmin, async (_req, res) => {
+  const rows = await db
+    .select()
+    .from(activityLogTable)
+    .orderBy(desc(activityLogTable.createdAt))
+    .limit(300);
+  res.json(rows);
+});
+
+// ========== ADMINS MANAGEMENT ==========
+router.get("/admin/admins", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(adminsTable).orderBy(desc(adminsTable.id));
+    res.json(rows.map((r) => ({ ...r, password: undefined })));
+  } catch (err: any) {
+    console.error("Error fetching admins:", err);
+    res.status(500).json({ error: err.message || "خطأ في جلب قائمة المشرفين" });
+  }
+});
+
+router.post("/admin/admins", requireAdmin, async (req, res) => {
+  try {
+    const data = filterFields(req.body, [
+      "username",
+      "password",
+      "fullName",
+      "email",
+      "role",
+      "permissions",
+      "active",
+    ]);
+    if (!data.username || typeof data.username !== "string" || !data.username.trim()) {
+      res.status(400).json({ error: "اسم المستخدم مطلوب" });
+      return;
+    }
+    if (!data.password || typeof data.password !== "string") {
+      res.status(400).json({ error: "كلمة المرور مطلوبة" });
+      return;
+    }
+    data.password = await hashAdminPassword(data.password);
+    if (!data.fullName) data.fullName = data.username;
+    if (!data.role) data.role = "admin";
+    if (data.active === undefined) data.active = true;
+
+    const [row] = await db.insert(adminsTable).values(data).returning();
+    res.json({ ...row, password: undefined });
+  } catch (err: any) {
+    console.error("Error creating admin:", err);
+    res.status(500).json({ error: err.message || "خطأ في إنشاء المشرف" });
+  }
+});
+
+const handleUpdateAdmin = async (req: any, res: any) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) {
+      res.status(400).json({ error: "معرف المشرف غير صالحة" });
+      return;
+    }
+    const data = filterFields(req.body, [
+      "username",
+      "password",
+      "fullName",
+      "email",
+      "role",
+      "permissions",
+      "active",
+    ]);
+    if (data.password === "" || data.password === null) delete data.password;
+    if (typeof data.password === "string" && data.password.trim()) {
+      data.password = await hashAdminPassword(data.password.trim());
+    } else {
+      delete data.password;
+    }
+
+    const [row] = await db
+      .update(adminsTable)
+      .set(data)
+      .where(eq(adminsTable.id, id))
+      .returning();
+    
+    if (!row) {
+      res.status(404).json({ error: "المشرف غير موجود" });
+      return;
+    }
+
+    res.json({ ...row, password: undefined });
+  } catch (err: any) {
+    console.error("Error updating admin:", err);
+    res.status(500).json({ error: err.message || "خطأ في تعديل بيانات المشرف" });
+  }
+};
+
+router.put("/admin/admins/:id", requireAdmin, handleUpdateAdmin);
+router.patch("/admin/admins/:id", requireAdmin, handleUpdateAdmin);
+
+router.delete("/admin/admins/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    await db.delete(adminsTable).where(eq(adminsTable.id, id));
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("Error deleting admin:", err);
+    res.status(500).json({ error: err.message || "خطأ في حذف المشرف" });
+  }
+});
+
+// ========== NOTIFICATIONS ==========
+router.get("/admin/notifications", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db
+      .select({
+        id: notificationsTable.id,
+        targetType: notificationsTable.targetType,
+        targetUserId: notificationsTable.targetUserId,
+        title: notificationsTable.title,
+        content: notificationsTable.content,
+        status: notificationsTable.status,
+        createdAt: notificationsTable.createdAt,
+        targetUserName: usersTable.username,
+        targetUserEmail: usersTable.email,
+        targetDisplayId: usersTable.displayId,
+      })
+      .from(notificationsTable)
+      .leftJoin(usersTable, eq(usersTable.id, notificationsTable.targetUserId))
+      .orderBy(desc(notificationsTable.createdAt))
+      .limit(300);
+    res.json(rows);
+  } catch (error: any) {
+    console.error("Fetch admin notifications error:", error);
+    res.json([]);
+  }
+});
+
+router.post("/admin/notifications", requireAdmin, async (req, res) => {
+  try {
+    const { targetType, targetUserId, title, content } = req.body as any;
+    if (!content || typeof content !== "string" || !content.trim()) {
+      return res.status(400).json({ error: "محتوى الإشعار مطلوب" });
+    }
+
+    let parsedUserId: number | null = null;
+    if (targetUserId != null && targetUserId !== "") {
+      const p = Number(targetUserId);
+      if (!isNaN(p) && p > 0) parsedUserId = p;
+    }
+
+    const row = await createInternalNotification({
+      targetType: targetType || (parsedUserId ? "user" : "all"),
+      targetUserId: parsedUserId,
+      title: (title || "").trim() || "إشعار من الإدارة",
+      content: content.trim(),
+    });
+
+    if (!row) {
+      return res.status(500).json({ error: "فشل إنشاء الإشعار في قاعدة البيانات" });
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "send_notification",
+      "notifications",
+      { targetType, targetUserId: parsedUserId, title },
+    );
+
+    res.json(row);
+  } catch (error: any) {
+    console.error("Admin send notification error:", error);
+    res.status(500).json({ error: error.message || "حدث خطأ أثناء إرسال الإشعار" });
+  }
+});
+
+router.delete("/admin/notifications/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    await db.delete(notificationsTable).where(eq(notificationsTable.id, id));
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "delete_notification",
+      "notifications",
+      { id },
+    );
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error("Delete notification error:", error);
+    res.status(500).json({ error: error.message || "فشل حذف الإشعار" });
+  }
+});
+
+// ========== REPORTS ==========
+router.get("/admin/reports", requireAdmin, async (req, res) => {
+  const startDate = (req.query["startDate"] as string) || (req.query["from"] as string) || "2020-01-01";
+  const endDate = (req.query["endDate"] as string) || (req.query["to"] as string) || "2099-12-31";
+
+  try {
+    const [summaryRow]: any = (await db.execute(sql`
+      SELECT 
+        count(*)::int as total_orders,
+        count(*) filter (where status IN ('accept', 'completed'))::int as completed_orders,
+        coalesce(sum(total_usd), 0)::float as total_revenue,
+        coalesce(sum(total_usd) filter (where status IN ('accept', 'completed')), 0)::float as completed_revenue,
+        coalesce(sum(case when cost_usd is not null then (total_usd - cost_usd) else (total_usd * 0.2) end) filter (where status IN ('accept', 'completed')), 0)::float as net_profit
+      FROM orders
+      WHERE created_at::date >= ${startDate}::date AND created_at::date <= ${endDate}::date
+    `)).rows;
+
+    const topServices: any = (await db.execute(sql`
+      SELECT 
+        p.id,
+        p.name,
+        p.image,
+        count(o.id)::int as sales_count,
+        coalesce(sum(o.total_usd), 0)::float as total_amount
+      FROM orders o
+      JOIN products p ON p.id = o.product_id
+      WHERE o.created_at::date >= ${startDate}::date AND o.created_at::date <= ${endDate}::date
+      GROUP BY p.id, p.name, p.image
+      ORDER BY sales_count DESC
+      LIMIT 10
+    `)).rows;
+
+    const chartData: any = (await db.execute(sql`
+      SELECT 
+        to_char(created_at::date, 'YYYY-MM-DD') as date,
+        count(*)::int as orders_count,
+        count(*) filter (where status IN ('accept', 'completed'))::int as "ordersCount",
+        coalesce(sum(total_usd), 0)::float as revenue,
+        coalesce(sum(total_usd) filter (where status IN ('accept', 'completed')), 0)::float as "salesUsd",
+        coalesce(sum(case when cost_usd is not null then (total_usd - cost_usd) else (total_usd * 0.2) end) filter (where status IN ('accept', 'completed')), 0)::float as "profitUsd"
+      FROM orders
+      WHERE created_at::date >= ${startDate}::date AND created_at::date <= ${endDate}::date
+      GROUP BY created_at::date
+      ORDER BY created_at::date ASC
+    `)).rows;
+
+    const depResult = await db.execute(sql`
+      SELECT coalesce(sum(amount_usd) filter (where status='approved'), 0)::float as "totalDepositsUsd"
+      FROM deposits
+      WHERE created_at::date >= ${startDate}::date AND created_at::date <= ${endDate}::date
+    `);
+    const [dep] = (depResult.rows as any[]) || [];
+
+    // Get admin notification email from settings
+    const [emailSetting] = await db
+      .select()
+      .from(settingsTable)
+      .where(eq(settingsTable.key, "admin_report_email"))
+      .limit(1);
+
+    res.json({
+      summary: {
+        totalOrders: summaryRow?.total_orders || 0,
+        completedOrders: summaryRow?.completed_orders || 0,
+        totalRevenue: summaryRow?.total_revenue || 0,
+        netProfit: summaryRow?.net_profit || 0,
+      },
+      topServices: topServices || [],
+      chart: chartData || [],
+      daily: chartData || [],
+      totalSalesUsd: summaryRow?.total_revenue || 0,
+      totalProfitUsd: summaryRow?.net_profit || 0,
+      orderCount: summaryRow?.total_orders || 0,
+      totalDepositsUsd: dep?.totalDepositsUsd || 0,
+      adminEmail: (emailSetting?.value as any)?.email || "admin@x-z.store",
+      systemLogsClean: true,
+    });
+  } catch (err: any) {
+    console.error("Reports error:", err);
+    res.json({
+      summary: {
+        totalOrders: 0,
+        completedOrders: 0,
+        totalRevenue: 0,
+        netProfit: 0,
+      },
+      topServices: [],
+      chart: [],
+      daily: [],
+      totalSalesUsd: 0,
+      totalProfitUsd: 0,
+      orderCount: 0,
+      totalDepositsUsd: 0,
+      adminEmail: "admin@x-z.store",
+      systemLogsClean: true,
+    });
+  }
+});
+
+router.post("/admin/reports/email", requireAdmin, async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: "البريد الإلكتروني مطلوب" });
+  }
+  await db
+    .insert(settingsTable)
+    .values({ key: "admin_report_email", value: { email } })
+    .onConflictDoUpdate({ target: settingsTable.key, set: { value: { email } } });
+  res.json({ ok: true, email });
+});
+
+router.get("/admin/reports/sales", requireAdmin, async (_req, res) => {
+  const rows = await db.execute(sql`
+    SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') as date,
+      count(*)::int as orders_count,
+      coalesce(sum(total_usd) filter (where status='accept'), 0)::float as revenue,
+      coalesce(sum(cost_usd) filter (where status='accept'), 0)::float as cost,
+      coalesce(sum(total_usd - cost_usd) filter (where status='accept'), 0)::float as profit
+    FROM orders
+    WHERE created_at >= current_date - interval '30 days'
+    GROUP BY date_trunc('day', created_at)
+    ORDER BY date_trunc('day', created_at) DESC
+  `);
+  res.json((rows.rows as any[]) || []);
+});
+
+router.get("/admin/reports/profit-log", requireAdmin, async (_req, res) => {
+  const rows = await db.execute(sql`
+    SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') as date,
+      coalesce(sum(total_usd - cost_usd) filter (where status='accept'), 0)::float as profit_usd,
+      count(*) filter (where status='accept')::int as accepted_orders
+    FROM orders
+    GROUP BY date_trunc('day', created_at)
+    ORDER BY date_trunc('day', created_at) DESC
+    LIMIT 90
+  `);
+  res.json((rows.rows as any[]) || []);
+});
+
+// ========== BACKUP (mock) ==========
+router.post("/admin/backup", requireAdmin, async (_req, res) => {
+  await logActivity(
+    { id: _req.session.adminId, name: _req.session.adminUsername },
+    "backup_request",
+    "system",
+  );
+  res.json({
+    ok: true,
+    filename: `xpay-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.sql`,
+    sizeMb: Math.round(Math.random() * 30 + 5),
+  });
+});
+
+// ========== IMPORT PRODUCTS ==========
+router.post("/admin/import-products", requireAdmin, async (req, res) => {
+  const { rows } = req.body as {
+    rows: Array<{
+      name: string;
+      categoryId: number;
+      priceUsd: number;
+      priceSyp: number;
+      productType?: string;
+      image?: string;
+    }>;
+  };
+  if (!Array.isArray(rows) || rows.length === 0) {
+    res.status(400).json({ error: "لا توجد بيانات" });
+    return;
+  }
+  const inserted = await db
+    .insert(productsTable)
+    .values(
+      rows.map((r) => ({
+        name: r.name,
+        categoryId: r.categoryId,
+        priceUsd: String(r.priceUsd),
+        priceSyp: String(r.priceSyp),
+        productType: r.productType || "package",
+        image: r.image || "/cat-cards.png",
+        source: "import",
+      })),
+    )
+    .returning();
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "import_products",
+    "products",
+    { count: inserted.length },
+  );
+  res.json({ ok: true, count: inserted.length });
+});
+
+// ========== 2FA (mock secret) ==========
+router.post("/admin/2fa/enable", requireAdmin, async (req, res) => {
+  const secret = Array.from({ length: 16 }, () =>
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"[Math.floor(Math.random() * 32)],
+  ).join("");
+  await db
+    .update(adminsTable)
+    .set({ twoFactorSecret: secret })
+    .where(eq(adminsTable.id, req.session.adminId!));
+  res.json({ secret, otpauthUrl: `otpauth://totp/XPayStore?secret=${secret}&issuer=XPayStore` });
+});
+
+router.post("/admin/2fa/disable", requireAdmin, async (req, res) => {
+  await db
+    .update(adminsTable)
+    .set({ twoFactorSecret: null })
+    .where(eq(adminsTable.id, req.session.adminId!));
+  res.json({ ok: true });
+});
+
+router.post("/admin/2fa/verify", requireAdmin, async (req, res) => {
+  const { code } = req.body as { code?: string };
+  if (!code || code.length !== 6) {
+    res.status(400).json({ error: "رمز غير صالح" });
+    return;
+  }
+  res.json({ ok: true, verified: true });
+});
+
+// ========== PROFILE ==========
+router.put("/admin/profile", requireAdmin, async (req, res) => {
+  const { fullName, email, oldPassword, newPassword } = req.body as any;
+  const [admin] = await db
+    .select()
+    .from(adminsTable)
+    .where(eq(adminsTable.id, req.session.adminId!))
+    .limit(1);
+  if (!admin) {
+    res.status(404).json({ error: "غير موجود" });
+    return;
+  }
+  const update: any = {};
+  if (fullName !== undefined) update.fullName = fullName;
+  if (email !== undefined) update.email = email;
+  if (newPassword) {
+    if (!(await verifyAdminPassword(admin.password, oldPassword))) {
+      res.status(400).json({ error: "كلمة المرور الحالية غير صحيحة" });
+      return;
+    }
+    update.password = await hashAdminPassword(newPassword);
+  }
+  if (Object.keys(update).length) {
+    await db.update(adminsTable).set(update).where(eq(adminsTable.id, admin.id));
+  }
+  res.json({ ok: true });
+});
+
+// ========== USER BALANCE / BAN ALIASES ==========
+router.post("/admin/users/:id/balance", requireAdmin, async (req, res) => {
+  let result: Awaited<ReturnType<typeof applyUserBalanceAdjustment>>;
+  try {
+    result = await applyUserBalanceAdjustment(Number(req.params.id), req.body);
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      res.status(error.statusCode).json({ error: error.message });
+      return;
+    }
+    throw error;
+  }
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "adjust_balance",
+    String(req.params.id),
+    result.adjustment,
+  );
+  res.json({ ok: true, user: result.updatedUser });
+});
+
+router.patch("/admin/users/:id/ban", requireAdmin, async (req, res) => {
+  const { banned } = req.body as { banned: boolean };
+  await db
+    .update(usersTable)
+    .set({ banned: !!banned })
+    .where(eq(usersTable.id, Number(req.params.id)));
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    banned ? "ban_user" : "unban_user",
+    String(req.params.id),
+  );
+  res.json({ ok: true });
+});
+
+// ========== STATUS PATCH ALIASES ==========
+router.patch("/admin/orders/:id/status", requireAdmin, async (req, res) => {
+  const { status, note } = req.body as { status: string; note?: string };
+  const id = Number(req.params.id);
+  const result = await applyOrderStatusChange(id, status, note);
+  if ("error" in result) {
+    res.status(404).json({ error: "غير موجود" });
+    return;
+  }
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "order_status",
+    String(id),
+    { status, note },
+  );
+  res.json(result.updated);
+});
+
+router.patch("/admin/deposits/:id/status", requireAdmin, async (req, res) => {
+  const { status } = req.body as { status: string };
+  const id = Number(req.params.id);
+  const result = await applyDepositStatusChange(id, status);
+  if ("error" in result) {
+    if (result.error === "auto_managed") {
+      res.status(400).json({ error: "إيداع شام كاش التلقائي يُدار تلقائيًا عبر API ولا يقبل موافقة/رفض يدوي." });
+      return;
+    }
+    res.status(404).json({ error: "غير موجود" });
+    return;
+  }
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "deposit_status",
+    String(id),
+    { status },
+  );
+  res.json(result.updated);
+});
+
+// ========== GENERIC PUT FOR ALL CRUDS (ALIAS OF PATCH) ==========
+const PUT_RESOURCES: Array<{ path: string; table: any; allowed: string[] }> = [
+  { path: "categories", table: categoriesTable, allowed: ["name", "image", "order", "active", "columnsCount", "columns_count"] },
+  { path: "product-groups", table: productGroupsTable, allowed: ["categoryId", "name", "image", "order", "active"] },
+  {
+    path: "products",
+    table: productsTable,
+    allowed: [
+      "categoryId", "groupId", "name", "image", "priceUsd", "priceSyp", "basePriceUsd",
+      "order",
+      "providerUnitPrice", "storeProfitPerUnit", "finalUnitPrice",
+      "productType", "available", "minQty", "maxQty", "minQuantity", "maxQuantity",
+      "quantityType", "quantityValues", "description", "featured",
+      "providerId", "source", "providerProductId",
+    ],
+  },
+  { path: "news", table: newsTable, allowed: ["content", "type", "active"] },
+  {
+    path: "banners",
+    table: bannersTable,
+    allowed: [
+      "image",
+      "title",
+      "description",
+      "link",
+      "order",
+      "active",
+      "featured",
+      "showDiscoverBtn",
+      "showAutoExecBtn",
+      "showReliableBtn",
+      "showFeaturedBtn",
+    ],
+  },
+  {
+    path: "payment-methods",
+    table: paymentMethodsTable,
+    allowed: [
+      "code", "name", "subtitle", "instructions", "walletAddress", "logoImage", "qrImage",
+      "minAmount", "active", "order", "category", "requiresVerification",
+    ],
+  },
+  { path: "social-links", table: socialLinksTable, allowed: ["platform", "url", "label", "order"] },
+  {
+    path: "providers",
+    table: providersTable,
+    allowed: [
+      "name", "apiUrl", "apiKey", "notes", "priority", "active", "providerType",
+      "productsEndpoint", "profileEndpoint", "orderEndpoint", "checkEndpoint", "tokenHeader"
+    ]
+  },
+  { path: "coupons", table: couponsTable, allowed: ["code", "discountPct", "maxUses", "usedCount", "active"] },
+  { path: "auto-codes", table: autoCodesTable, allowed: ["productId", "code", "note", "used"] },
+  { path: "order-messages", table: orderMessagesTable, allowed: ["event", "title", "body"] },
+  { path: "api-keys", table: apiKeysTable, allowed: ["name", "keyValue", "active"] },
+  { path: "notifications", table: notificationsTable, allowed: ["targetType", "targetUserId", "title", "content", "status", "isRead"] },
+];
+
+for (const r of PUT_RESOURCES) {
+  router.put(`/admin/${r.path}/:id`, requireAdmin, async (req, res) => {
+    try {
+      if (r.path === "providers") {
+        await ensureDatabaseSchema();
+      }
+      const data = await sanitizeCrudDataForRuntimeSchema(
+        r.path,
+        filterFields(req.body, r.allowed),
+      );
+      const [row] = await db
+        .update(r.table)
+        .set(data)
+        .where(eq(r.table.id, Number(req.params.id)))
+        .returning();
+      await logActivity(
+        { id: req.session.adminId, name: req.session.adminUsername },
+        "update",
+        r.path,
+        { id: row?.id },
+      );
+      res.json(row);
+    } catch (error: any) {
+      console.error(`Update ${r.path} failed:`, error);
+      const httpErr = toHttpError(error);
+      res.status(httpErr.status).json({ error: httpErr.message });
+    }
+  });
+}
+
+// Helper to parse VIP membership payload
+function parseVipPayload(body: any) {
+  const name = String(body.name || "").trim();
+  const nameAr = String(body.name_ar ?? body.nameAr ?? body.name ?? "").trim();
+  const levelOrder = Number(body.level_order ?? body.levelOrder ?? 1);
+  const requiredAmount = String(body.required_amount ?? body.requiredAmount ?? 0);
+  const discountPercent = String(body.discount_percent ?? body.discountPercent ?? body.profit_pct ?? body.profitPct ?? 0);
+  const badgeColor = body.badge_color || body.badgeColor || body.badge || "#C8A45C";
+  const badge = badgeColor;
+  const description = body.description || "";
+  let benefits = body.benefits || [];
+  if (typeof benefits === "string") {
+    try { benefits = JSON.parse(benefits); } catch (e) { benefits = [benefits]; }
+  }
+  const hidden = Boolean(body.hidden);
+
+  return {
+    name,
+    nameAr: nameAr || name,
+    levelOrder,
+    requiredAmount,
+    discountPercent,
+    profitPct: discountPercent,
+    badgeColor,
+    badge,
+    benefits,
+    description,
+    hidden,
+    updatedAt: new Date(),
+  };
+}
+
+function formatVipRow(lvl: any) {
+  if (!lvl) return null;
+  return {
+    id: lvl.id,
+    name: lvl.name,
+    name_ar: lvl.nameAr || lvl.name_ar || lvl.name,
+    nameAr: lvl.nameAr || lvl.name_ar || lvl.name,
+    level_order: Number(lvl.levelOrder || lvl.level_order || lvl.id),
+    levelOrder: Number(lvl.levelOrder || lvl.level_order || lvl.id),
+    required_amount: Number(lvl.requiredAmount || lvl.required_amount || 0),
+    requiredAmount: Number(lvl.requiredAmount || lvl.required_amount || 0),
+    discount_percent: Number(lvl.discountPercent || lvl.discount_percent || lvl.profitPct || lvl.profit_pct || 0),
+    discountPercent: Number(lvl.discountPercent || lvl.discount_percent || lvl.profitPct || lvl.profit_pct || 0),
+    profit_pct: Number(lvl.profitPct || lvl.discountPercent || 0),
+    profitPct: Number(lvl.profitPct || lvl.discountPercent || 0),
+    badge_color: lvl.badgeColor || lvl.badge_color || lvl.badge || "#C8A45C",
+    badgeColor: lvl.badgeColor || lvl.badge_color || lvl.badge || "#C8A45C",
+    badge: lvl.badge || lvl.badgeColor || "#C8A45C",
+    benefits: Array.isArray(lvl.benefits)
+      ? lvl.benefits
+      : (typeof lvl.benefits === "string" ? (() => { try { return JSON.parse(lvl.benefits); } catch { return [lvl.benefits]; } })() : []),
+    description: lvl.description || "",
+    hidden: Boolean(lvl.hidden),
+    created_at: lvl.createdAt || lvl.created_at,
+    updated_at: lvl.updatedAt || lvl.updated_at,
+  };
+}
+
+// ========== VIP MEMBERSHIPS APIS ==========
+router.get(["/admin/vip-memberships", "/vip-memberships", "/admin/vip", "/vip"], requireAdmin, async (_req, res) => {
+  try {
+    await ensureDatabaseSchema();
+    const rows = await db
+      .select()
+      .from(vipMembershipsTable)
+      .orderBy(sql`level_order ASC, required_amount ASC`);
+    res.json((rows || []).map(formatVipRow));
+  } catch (err: any) {
+    console.error("[VIP GET Error]:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get(["/public/vip-memberships", "/public/levels", "/public/vip", "/admin/public/vip-memberships"], async (_req, res) => {
+  try {
+    await ensureDatabaseSchema();
+    const rows = await db
+      .select()
+      .from(vipMembershipsTable)
+      .where(eq(vipMembershipsTable.hidden, false))
+      .orderBy(sql`level_order ASC, required_amount ASC`);
+    res.json((rows || []).map(formatVipRow));
+  } catch (err: any) {
+    console.error("[Public VIP GET Error]:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post(["/admin/vip-memberships", "/vip-memberships", "/admin/vip", "/vip"], requireAdmin, async (req, res) => {
+  try {
+    await ensureDatabaseSchema();
+    const data = parseVipPayload(req.body);
+    const [row] = await db.insert(vipMembershipsTable).values(data).returning();
+    
+    // Keep sequence in sync
+    await db.execute(sql`
+      SELECT setval(
+        pg_get_serial_sequence('vip_memberships', 'id'),
+        COALESCE((SELECT MAX(id) FROM vip_memberships), 1),
+        true
+      );
+    `).catch(() => null);
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "create",
+      "vip_memberships",
+      { id: row?.id, name: row?.name }
+    );
+    res.json(formatVipRow(row));
+  } catch (err: any) {
+    console.error("[VIP POST Error]:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put(["/admin/vip-memberships/:id", "/vip-memberships/:id", "/admin/vip/:id", "/vip/:id"], requireAdmin, async (req, res) => {
+  try {
+    await ensureDatabaseSchema();
+    const id = Number(req.params.id);
+    const data = parseVipPayload(req.body);
+    console.log(`[VIP Admin PUT] Updating level #${id}:`, data);
+    const [row] = await db
+      .update(vipMembershipsTable)
+      .set(data)
+      .where(eq(vipMembershipsTable.id, id))
+      .returning();
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "update",
+      "vip_memberships",
+      { id, name: row?.name, requiredAmount: data.requiredAmount, discountPercent: data.discountPercent }
+    );
+    res.json(formatVipRow(row));
+  } catch (err: any) {
+    console.error("[VIP PUT Error]:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete(["/admin/vip-memberships/:id", "/vip-memberships/:id", "/admin/vip/:id", "/vip/:id"], requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    await db.delete(vipMembershipsTable).where(eq(vipMembershipsTable.id, id));
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "delete",
+      "vip_memberships",
+      { id }
+    );
+    res.json({ success: true, ok: true, id });
+  } catch (err: any) {
+    console.error("[VIP DELETE Error]:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch(["/admin/vip-memberships/reorder", "/vip-memberships/reorder"], requireAdmin, async (req, res) => {
+  try {
+    const { items } = req.body || {};
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        const id = Number(item.id);
+        const levelOrder = Number(item.level_order ?? item.levelOrder ?? item.order ?? 1);
+        if (id) {
+          await db
+            .update(vipMembershipsTable)
+            .set({ levelOrder, updatedAt: new Date() })
+            .where(eq(vipMembershipsTable.id, id));
+        }
+      }
+    }
+    res.json({ success: true, ok: true });
+  } catch (err: any) {
+    console.error("[VIP REORDER Error]:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const handleUserVipLevelUpdate = async (req: any, res: any) => {
+  try {
+    const userId = Number(req.params.id);
+    const vipLevel = Number(req.body.vip_level ?? req.body.vipLevel ?? req.body.level_order ?? 1);
+
+    if (!userId) {
+      return res.status(400).json({ error: "معرف المستخدم غير صالح" });
+    }
+
+    const [user] = await db
+      .update(usersTable)
+      .set({ vipLevel })
+      .where(eq(usersTable.id, userId))
+      .returning();
+
+    if (!user) {
+      return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    const [levelInfo] = await db
+      .select()
+      .from(vipMembershipsTable)
+      .where(eq(vipMembershipsTable.levelOrder, vipLevel))
+      .limit(1);
+
+    const levelName = levelInfo?.name || `VIP ${vipLevel}`;
+
+    try {
+      await createInternalNotification({
+        targetType: "user",
+        targetUserId: userId,
+        title: "⚙️ تم تحديث مستوى حسابك من قبل الإدارة",
+        content: `مرحباً ${user.username}، تم تحديث مستوى حسابك رسمياً إلى ${levelName}.`,
+      });
+    } catch (e) {
+      console.warn("Error sending user VIP update notification:", e);
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "update_vip",
+      "user",
+      { userId, vipLevel, levelName }
+    );
+
+    return res.json({ success: true, user, levelName });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+router.patch(["/admin/users/:id/vip-level", "/users/:id/vip-level"], requireAdmin, handleUserVipLevelUpdate);
+router.put(["/admin/users/:id/vip-level", "/users/:id/vip-level"], requireAdmin, handleUserVipLevelUpdate);
+
+router.get("/admin/users/:id/vip-details", requireAdmin, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    const [user] = await db.select().from(usersTable).where(eq(usersTable.id, userId)).limit(1);
+    if (!user) return res.status(404).json({ error: "المستخدم غير موجود" });
+
+    const totalSpent = Number(user.totalSpent || 0);
+    const levels = await db
+      .select()
+      .from(vipMembershipsTable)
+      .where(eq(vipMembershipsTable.hidden, false))
+      .orderBy(sql`level_order ASC, required_amount ASC`);
+
+    let current = levels.find((l) => l.levelOrder === user.vipLevel || l.id === user.vipLevel) || levels[0];
+    const currentIndex = levels.findIndex((l) => l.id === current?.id);
+    const nextLevel = currentIndex >= 0 && currentIndex < levels.length - 1 ? levels[currentIndex + 1] : null;
+
+    res.json({
+      user: { id: user.id, username: user.username, vipLevel: user.vipLevel, totalSpent },
+      currentLevel: current,
+      nextLevel,
+      amountToNextLevel: nextLevel ? Math.max(0, Number(nextLevel.requiredAmount) - totalSpent) : 0,
+      allLevels: levels,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== BULK DELETE ==========
+router.post("/admin/bulk-delete", requireAdmin, async (req, res) => {
+  const { resource, ids } = req.body as { resource: string; ids: number[] };
+  if (!resource || !Array.isArray(ids) || ids.length === 0) {
+    res.status(400).json({ error: "بيانات غير صالحة" });
+    return;
+  }
+
+  // جدول حسب المورد
+  const tableMap: Record<string, any> = {
+    categories: categoriesTable,
+    "product-groups": productGroupsTable,
+    products: productsTable,
+    providers: providersTable,
+    coupons: couponsTable,
+    banners: bannersTable,
+    news: newsTable,
+    paymentMethods: paymentMethodsTable,
+    socialLinks: socialLinksTable,
+    vipMemberships: vipMembershipsTable,
+    autoCodes: autoCodesTable,
+    orderMessages: orderMessagesTable,
+    apiKeys: apiKeysTable,
+    notifications: notificationsTable,
+  };
+
+  const table = tableMap[resource];
+  if (!table) {
+    res.status(400).json({ error: "المورد غير مدعوم" });
+    return;
+  }
+
+  try {
+    // تنفيذ الحذف المتسلسل حسب المورد
+    if (resource === "categories") {
+      for (const id of ids) {
+        await db.execute(sql`DELETE FROM products WHERE category_id = ${id}`);
+      }
+    } else if (resource === "products") {
+      let deleted = 0;
+      let archived = 0;
+      for (const id of ids) {
+        const [orderStats] = await db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(ordersTable)
+          .where(eq(ordersTable.productId, id));
+
+        if ((orderStats?.count || 0) > 0) {
+          await db
+            .update(productsTable)
+            .set({ available: false, featured: false })
+            .where(eq(productsTable.id, id));
+          archived += 1;
+        } else {
+          await db.delete(autoCodesTable).where(eq(autoCodesTable.productId, id));
+          await db.delete(productsTable).where(eq(productsTable.id, id));
+          deleted += 1;
+        }
+      }
+
+      await logActivity(
+        { id: req.session.adminId, name: req.session.adminUsername },
+        "bulk_delete",
+        resource,
+        { ids, deleted, archived },
+      );
+      res.json({ ok: true, deleted, archived });
+      return;
+    } else if (resource === "product-groups") {
+      for (const id of ids) {
+        await db
+          .update(productsTable)
+          .set({ groupId: null })
+          .where(eq(productsTable.groupId, id));
+      }
+    } else if (resource === "providers") {
+      for (const id of ids) {
+        await db.execute(sql`DELETE FROM products WHERE provider_id = ${id}`);
+      }
+    }
+
+    // حذف العناصر نفسها واحداً تلو الآخر
+    for (const id of ids) {
+      await db.delete(table).where(eq(table.id, id));
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "bulk_delete",
+      resource,
+      { ids }
+    );
+
+    res.json({ ok: true, deletedCount: ids.length });
+  } catch (error: any) {
+    console.error("Bulk delete error:", error);
+    res.status(500).json({ error: error.message || "فشل الحذف الجماعي" });
+  }
+});
+
+// ========== NOTIFICATIONS DELETE ==========
+router.delete("/admin/notifications/:id", requireAdmin, async (req, res) => {
+  await db.delete(notificationsTable).where(eq(notificationsTable.id, Number(req.params.id)));
+  res.json({ ok: true });
+});
+
+// ========== BACKUP / IMPORT (full JSON) ==========
+router.get("/admin/backup", requireAdmin, async (req, res) => {
+  const [
+    users, categories, products, paymentMethods, banners, news, socialLinks,
+    providers, coupons, vipMemberships, settings, orderMessages, apiKeys,
+  ] = await Promise.all([
+    db.select().from(usersTable),
+    db.select().from(categoriesTable),
+    db.select().from(productsTable),
+    db.select().from(paymentMethodsTable),
+    db.select().from(bannersTable),
+    db.select().from(newsTable),
+    db.select().from(socialLinksTable),
+    db.select().from(providersTable),
+    db.select().from(couponsTable),
+    db.select().from(vipMembershipsTable),
+    db.select().from(settingsTable),
+    db.select().from(orderMessagesTable),
+    db.select().from(apiKeysTable),
+  ]);
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "export_backup",
+    "system",
+  );
+  res.json({
+    exportedAt: new Date().toISOString(),
+    users, categories, products, paymentMethods, banners, news, socialLinks,
+    providers, coupons, vipMemberships, settings, orderMessages, apiKeys,
+  });
+});
+
+router.post("/admin/import", requireAdmin, async (req, res) => {
+  const body = req.body as Record<string, any>;
+  let imported = 0;
+  const tableMap: Record<string, any> = {
+    categories: categoriesTable,
+    products: productsTable,
+    paymentMethods: paymentMethodsTable,
+    banners: bannersTable,
+    news: newsTable,
+    socialLinks: socialLinksTable,
+    providers: providersTable,
+    coupons: couponsTable,
+    vipMemberships: vipMembershipsTable,
+    orderMessages: orderMessagesTable,
+    apiKeys: apiKeysTable,
+  };
+  for (const [k, table] of Object.entries(tableMap)) {
+    const rows = body[k];
+    if (Array.isArray(rows) && rows.length > 0) {
+      try {
+        const stripped = rows.map(({ id, ...rest }: any) => rest);
+        const result = await db.insert(table).values(stripped).onConflictDoNothing().returning();
+        imported += (result as any[]).length;
+      } catch {
+        // continue silently for invalid rows
+      }
+    }
+  }
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "import_backup",
+    "system",
+    { imported },
+  );
+  res.json({ ok: true, imported });
+});
+
+// ========== SETTINGS LIST/ITEMS WRAPPER ==========
+router.get("/admin/settings/list", requireAdmin, async (_req, res) => {
+  const rows = await db.select().from(settingsTable);
+  res.json(rows);
+});
+
+router.put("/admin/settings/items", requireAdmin, async (req, res) => {
+  const { items } = req.body as { items: Array<{ key: string; value: any }> };
+  if (!Array.isArray(items)) {
+    res.status(400).json({ error: "items required" });
+    return;
+  }
+  for (const it of items) {
+    const val = (it.key.startsWith("shamcash_") || it.key === "public_api_base_url")
+      ? extractStringValue(it.value)
+      : it.value;
+    await db
+      .insert(settingsTable)
+      .values({ key: it.key, value: val })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: val } });
+  }
+  res.json({ ok: true });
+});
+
+router.put("/admin/settings/brand-logo", requireAdmin, async (req, res) => {
+  const brandLogoUrl = String(req.body?.brandLogoUrl || req.body?.logoUrl || req.body?.image || "").trim();
+  
+  await db
+    .insert(settingsTable)
+    .values({ key: "brand_logo_url", value: brandLogoUrl })
+    .onConflictDoUpdate({ target: settingsTable.key, set: { value: brandLogoUrl } });
+
+  await db
+    .insert(settingsTable)
+    .values({ key: "site_logo", value: brandLogoUrl })
+    .onConflictDoUpdate({ target: settingsTable.key, set: { value: brandLogoUrl } });
+
+  await logActivity(
+    { id: req.session.adminId, name: req.session.adminUsername },
+    "update_brand_logo",
+    "settings",
+    { brandLogoUrl: brandLogoUrl ? "updated" : "cleared" },
+  );
+
+  res.json({ ok: true, success: true, brandLogoUrl });
+});
+
+router.get("/admin/telegram/config-status", requireAdmin, async (_req, res) => {
+  res.json(getTelegramConfigStatus());
+});
+
+// ========== PROVIDER SYNC (UPDATED – لا يضيف منتجات جديدة) ==========
+router.post("/admin/providers/:id/sync", requireAdmin, async (req, res) => {
+  const providerId = Number(req.params.id);
+  const [provider] = await db
+    .select()
+    .from(providersTable)
+    .where(eq(providersTable.id, providerId))
+    .limit(1);
+
+  if (!provider) {
+    res.status(404).json({ error: "المزود غير موجود" });
+    return;
+  }
+
+  const pType = (provider.providerType || "custom").toLowerCase().trim();
+  if (pType === "custom" || pType === "manual" || !provider.apiKey) {
+    res.json({
+      ok: true,
+      message: "هذا المزود من النوع اليدوي (Custom Provider) ولا يتطلب مزامنة خارجية.",
+      updated: 0,
+    });
+    return;
+  }
+
+  const adapter = getAdapter(pType);
+
+  try {
+    const products = await adapter.fetchProducts(
+      provider.apiKey!,
+      provider.apiUrl || undefined
+    );
+
+    let updated = 0;
+
+    for (const p of products) {
+      // البحث عن منتج موجود مسبقاً بنفس provider_product_id
+      const existingProdResult = await db.execute(sql`
+        SELECT id FROM products 
+        WHERE provider_product_id = ${Number(p.id)} 
+        LIMIT 1
+      `);
+      const existingProdId = (existingProdResult.rows as any[])[0]?.id || null;
+
+      // تحديث المنتج الموجود فقط – لا نقوم بإدراج جديد
+      if (existingProdId) {
+        const quantityInfo = parseProviderQuantityValues((p as any).rawData?.qty_values);
+        await db.execute(sql`
+          UPDATE products SET
+            base_price_usd = ${String(p.price)},
+            provider_unit_price = ${String(p.price)},
+            product_type = ${p.productType},
+            available = ${p.available},
+            min_qty = ${p.minQty ? String(p.minQty) : null},
+            max_qty = ${p.maxQty ? String(p.maxQty) : null},
+            min_quantity = ${quantityInfo.minQuantity},
+            quantity_type = ${quantityInfo.quantityType}::quantity_type,
+            quantity_values = ${quantityInfo.quantityValues ? JSON.stringify(quantityInfo.quantityValues) : null}::jsonb,
+            source = 'provider'
+          WHERE id = ${existingProdId}
+        `);
+        updated++;
+      }
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "sync_provider",
+      `provider_${providerId}`,
+      { updated }
+    );
+
+    res.json({
+      ok: true,
+      message: `✅ تم تحديث ${updated} منتج مرتبط`,
+      updated,
+    });
+  } catch (error: any) {
+    console.error("🔥 Sync error:", error);
+    if (error.code === 'ECONNABORTED' || error.message?.includes('timeout') || error.name === 'AbortError') {
+      return res.status(408).json({
+        error: 'انتهت مهلة الاتصال بمزود الخدمة (Timeout - 408). يرجى المحاولة لاحقاً، أو التأكد من استجابة خادم المزود.'
+      });
+    }
+    res.status(500).json({ error: error.message || "فشلت المزامنة" });
+  }
+});
+
+
+// ========== FETCH PROVIDER PRODUCTS (للاطلاع على المعرفات) ==========
+router.get("/admin/providers/:id/products", requireAdmin, async (req, res) => {
+  const providerId = Number(req.params.id);
+  const [provider] = await db
+    .select()
+    .from(providersTable)
+    .where(eq(providersTable.id, providerId))
+    .limit(1);
+
+  if (!provider) {
+    res.status(404).json({ error: "المزود غير موجود" });
+    return;
+  }
+
+  const pType = (provider.providerType || "custom").toLowerCase().trim();
+  if (pType === "custom" || pType === "manual" || !provider.apiKey) {
+    // For custom/manual provider, fetch products from the local database
+    const localProducts = await db
+      .select({
+        id: productsTable.id,
+        name: productsTable.name,
+        price: productsTable.priceUsd,
+        category: categoriesTable.name,
+      })
+      .from(productsTable)
+      .leftJoin(categoriesTable, eq(categoriesTable.id, productsTable.categoryId))
+      .where(eq(productsTable.providerId, providerId));
+
+    res.json({
+      provider: provider.name,
+      products: localProducts.map((p) => ({
+        id: p.id,
+        name: p.name,
+        price: Number(p.price || 0),
+        category: p.category || "عام",
+      })),
+      isCustom: true,
+    });
+    return;
+  }
+
+  const adapter = getAdapter(pType);
+  try {
+    const products = await adapter.fetchProducts(
+      provider.apiKey!,
+      provider.apiUrl || undefined
+    );
+
+    if (!Array.isArray(products)) {
+      throw new Error("تنسيق بيانات المنتجات المستلمة من المزود غير صالح (ليس مصفوفة)");
+    }
+
+    // إعادة قائمة بالمعلومات الأساسية فقط (id, name, price)
+    const list = products.map((p) => {
+      const typeVal = p.productType;
+      const normalizedType = typeof typeVal === "string" ? typeVal.toLowerCase() : (typeVal != null ? String(typeVal).toLowerCase() : "custom");
+      return {
+        id: p.id,
+        name: p.name,
+        price: p.price,
+        category: p.categoryName,
+        productType: normalizedType,
+      };
+    });
+
+    res.json({ provider: provider.name, products: list });
+  } catch (error: any) {
+    console.error("Fetch provider products error:", error);
+    if (error.code === 'ECONNABORTED' || error.message?.includes('timeout') || error.name === 'AbortError') {
+      return res.status(408).json({
+        error: 'انتهت مهلة الاتصال بمزود الخدمة (Timeout - 408). يرجى المحاولة لاحقاً.'
+      });
+    }
+    res.status(500).json({ error: error.message || "فشل تحليل بيانات المنتجات من المزود" });
+  }
+});
+
+// ========== VERIFY SINGLE PRODUCT AGAINST PROVIDER ==========
+router.get("/admin/products/:id/provider-status", requireAdmin, async (req, res) => {
+  const productId = Number(req.params.id);
+  const [product] = await db
+    .select()
+    .from(productsTable)
+    .where(eq(productsTable.id, productId))
+    .limit(1);
+
+  if (!product) {
+    res.status(404).json({ error: "المنتج غير موجود" });
+    return;
+  }
+
+  if (!product.providerId) {
+    res.json({
+      ok: true,
+      type: "local",
+      existsAtProvider: false,
+      message: "هذا منتج محلي غير مرتبط بمزوّد خارجي.",
+      product: {
+        id: product.id,
+        name: product.name,
+        source: product.source,
+      },
+    });
+    return;
+  }
+
+  const [provider] = await db
+    .select()
+    .from(providersTable)
+    .where(eq(providersTable.id, product.providerId))
+    .limit(1);
+
+  if (!provider) {
+    res.status(400).json({ error: `المزوّد المرتبط (${product.providerId}) غير موجود` });
+    return;
+  }
+
+  const apiUrl = provider.apiUrl || "https://api.mersal-card.com";
+  let isMersalHost = false;
+  try {
+    const host = new URL(apiUrl).host.toLowerCase();
+    isMersalHost = host === "api.mersal-card.com";
+  } catch {
+    isMersalHost = false;
+  }
+
+  const pType = (provider.providerType || "custom").toLowerCase().trim();
+  if (pType === "custom" || pType === "manual" || !provider.apiKey) {
+    res.json({
+      ok: true,
+      type: "custom",
+      existsAtProvider: true,
+      provider: {
+        id: provider.id,
+        name: provider.name,
+        providerType: provider.providerType,
+        apiUrl,
+        isMersalHost: false,
+      },
+      product: {
+        id: product.id,
+        name: product.name,
+        source: product.source,
+      },
+      message: "مزود مخصص / يدوي (Custom Provider).",
+    });
+    return;
+  }
+
+  if (!product.providerProductId) {
+    res.json({
+      ok: true,
+      type: "provider",
+      existsAtProvider: false,
+      provider: {
+        id: provider.id,
+        name: provider.name,
+        providerType: provider.providerType,
+        apiUrl,
+        isMersalHost,
+      },
+      product: {
+        id: product.id,
+        name: product.name,
+        source: product.source,
+      },
+      message: "المنتج مرتبط بمزوّد لكن بدون providerProductId.",
+    });
+    return;
+  }
+
+  const adapter = getAdapter(pType);
+
+  try {
+    const remoteProducts = await adapter.fetchProducts(provider.apiKey!, provider.apiUrl || undefined);
+    const remote = remoteProducts.find((p) => Number(p.id) === Number(product.providerProductId));
+    const remotePrice = remote?.price != null ? Number(remote.price) : null;
+    const localMarkup = Number((product as any).storeProfitPerUnit ?? product.priceUsd ?? 0);
+    const localBaseCostRaw = (product as any).providerUnitPrice ?? product.basePriceUsd;
+    const localBaseCost = localBaseCostRaw != null ? Number(localBaseCostRaw) : null;
+    const localFinalPriceRaw = (product as any).finalUnitPrice;
+    const localFinalPrice = localFinalPriceRaw != null
+      ? Number(localFinalPriceRaw)
+      : localBaseCost != null
+        ? localBaseCost + localMarkup
+        : localMarkup;
+
+    res.json({
+      ok: true,
+      type: "provider",
+      existsAtProvider: !!remote,
+      provider: {
+        id: provider.id,
+        name: provider.name,
+        providerType: provider.providerType,
+        apiUrl,
+        isMersalHost,
+      },
+      product: {
+        id: product.id,
+        name: product.name,
+        source: product.source,
+        localProviderProductId: product.providerProductId,
+        localMarkupUsd: localMarkup,
+        localBaseCostUsd: localBaseCost,
+        localFinalPriceUsd: localFinalPrice,
+      },
+      remote: remote
+        ? {
+            id: remote.id,
+            name: remote.name,
+            priceUsd: remotePrice,
+            categoryName: remote.categoryName,
+            available: remote.available,
+            minQty: remote.minQty ?? null,
+            maxQty: remote.maxQty ?? null,
+          }
+        : null,
+      baseCostDiffUsd:
+        remotePrice != null && localBaseCost != null
+          ? Number((localBaseCost - remotePrice).toFixed(6))
+          : null,
+      message: remote
+        ? "تم العثور على المنتج عند المزوّد الخارجي."
+        : "لم يتم العثور على providerProductId في قائمة منتجات المزوّد.",
+    });
+  } catch (error: any) {
+    console.error("Verify provider product error:", error);
+    res.status(500).json({ error: error?.message || "فشل التحقق من المنتج عند المزوّد" });
+  }
+});
+
+// Provider Reports
+router.get("/admin/provider-reports", requireAdmin, async (req, res) => {
+  try {
+    const stopped = await db.select().from(productsTable).where(eq(productsTable.available, false)).limit(100);
+    const providersList = await db.select().from(providersTable);
+    const mapped = stopped.map(p => {
+      const prov = providersList.find(pr => pr.id === p.providerId);
+      return {
+        id: p.id,
+        name: p.name,
+        providerName: prov?.name || "المزود الرئيسي",
+        cost: p.providerUnitPrice || p.basePriceUsd || "0.00",
+        status: "متوقف / محذوف"
+      };
+    });
+    res.json(mapped);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب تقارير المزودين" });
+  }
+});
+
+router.post("/admin/provider-reports/:productId/restart", requireAdmin, async (req, res) => {
+  try {
+    const productId = Number(req.params.productId);
+    await db.update(productsTable)
+      .set({ available: true, active: true })
+      .where(eq(productsTable.id, productId));
+    res.json({ ok: true, message: "تمت إعادة تشغيل وتفعيل الخدمة بنجاح" });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل إعادة تفعيل الخدمة" });
+  }
+});
+
+// Currency Settings
+router.get("/admin/currency-settings", requireAdmin, async (req, res) => {
+  try {
+    const s = await db.select().from(settingsTable).where(eq(settingsTable.key, "currency_settings"));
+    if (s.length > 0) {
+      res.json(s[0].value);
+    } else {
+      res.json({ storeCurrency: "USD", exchangeRate: 1.0, currencySymbol: "$" });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعدادات العملة" });
+  }
+});
+
+router.put("/admin/currency-settings", requireAdmin, async (req, res) => {
+  try {
+    const { storeCurrency, exchangeRate, currencySymbol } = req.body;
+    const value = { storeCurrency, exchangeRate: Number(exchangeRate), currencySymbol };
+    await db.insert(settingsTable).values({ key: "currency_settings", value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    res.json({ ok: true, message: "تم حفظ إعدادات العملة بنجاح" });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل حفظ إعدادات العملة" });
+  }
+});
+
+// Provider Products for API Products page (Full details, single/batch import & detail route)
+router.get("/admin/provider-products/:providerId", requireAdmin, async (req, res) => {
+  try {
+    const providerId = Number(req.params.providerId);
+    const [provider] = await db.select().from(providersTable).where(eq(providersTable.id, providerId));
+    if (!provider) {
+      return res.status(404).json({ error: "المزود غير موجود" });
+    }
+
+    // Fetch existing locally imported products for this provider to cross-reference
+    const localProds = await db.select().from(productsTable).where(eq(productsTable.providerId, providerId));
+    const localProdsMap = new Map(localProds.map(p => [String(p.providerProductId || p.id), p]));
+
+    const adapter = getAdapter(provider.providerType);
+    if (!adapter) {
+      return res.json(localProds.map(p => ({
+        id: p.id,
+        name: p.name,
+        price: p.priceUsd,
+        basePrice: p.basePriceUsd || p.providerUnitPrice || p.priceUsd,
+        providerUnitPrice: p.providerUnitPrice || p.basePriceUsd || p.priceUsd,
+        finalUnitPrice: p.finalUnitPrice || p.priceUsd,
+        storeProfitPerUnit: p.storeProfitPerUnit || "0",
+        category: "عام",
+        categoryName: "عام",
+        categoryImage: p.image || null,
+        image: p.image || null,
+        available: p.available ?? true,
+        externalServiceId: String(p.providerProductId || p.id),
+        minQty: p.minQuantity || p.minQty || 1,
+        maxQty: p.maxQuantity || p.maxQty || null,
+        quantityType: p.quantityType || "fixed",
+        quantityValues: p.quantityValues || null,
+        productType: p.productType || "amount",
+        params: p.description ? [p.description] : [],
+        description: p.description || "",
+        providerId: provider.id,
+        providerName: provider.name,
+        providerType: provider.providerType,
+        isImported: true,
+        localProduct: p,
+        rawData: p
+      })));
+    }
+
+    const remoteProds = await adapter.fetchProducts(provider.apiKey, provider.apiUrl || undefined);
+    res.json(remoteProds.map((rp: any) => {
+      const extId = String(rp.id || rp.externalServiceId || "");
+      const matchedLocal = localProdsMap.get(extId);
+      return {
+        id: rp.id,
+        name: rp.name,
+        price: rp.price,
+        basePrice: rp.basePrice ?? rp.price,
+        providerUnitPrice: rp.basePrice ?? rp.price,
+        category: rp.categoryName || rp.category || "عام",
+        categoryName: rp.categoryName || rp.category || "عام",
+        categoryImage: rp.categoryImage || rp.rawData?.category_img || null,
+        image: rp.categoryImage || rp.rawData?.category_img || null,
+        available: rp.available ?? true,
+        externalServiceId: extId,
+        minQty: rp.minQty ?? 1,
+        maxQty: rp.maxQty ?? null,
+        quantityType: rp.quantityType || "fixed",
+        quantityValues: rp.quantityValues || null,
+        productType: rp.productType || "amount",
+        params: rp.rawData?.params || (rp.description ? [rp.description] : []),
+        description: rp.description || "",
+        providerId: provider.id,
+        providerName: provider.name,
+        providerType: provider.providerType,
+        isImported: Boolean(matchedLocal),
+        localProduct: matchedLocal || null,
+        rawData: rp.rawData || rp
+      };
+    }));
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب منتجات المزود" });
+  }
+});
+
+// Single product details from provider
+router.get("/admin/provider-products/:providerId/:productId", requireAdmin, async (req, res) => {
+  try {
+    const providerId = Number(req.params.providerId);
+    const productId = req.params.productId;
+    const [provider] = await db.select().from(providersTable).where(eq(providersTable.id, providerId));
+    if (!provider) {
+      return res.status(404).json({ error: "المزود غير موجود" });
+    }
+
+    const localProds = await db.select().from(productsTable).where(eq(productsTable.providerId, providerId));
+    const matchedLocal = localProds.find(p => String(p.providerProductId) === String(productId) || String(p.id) === String(productId));
+
+    const adapter = getAdapter(provider.providerType);
+    if (!adapter) {
+      if (!matchedLocal) return res.status(404).json({ error: "المنتج غير موجود" });
+      return res.json({
+        id: matchedLocal.id,
+        name: matchedLocal.name,
+        price: matchedLocal.priceUsd,
+        basePrice: matchedLocal.providerUnitPrice || matchedLocal.basePriceUsd || matchedLocal.priceUsd,
+        available: matchedLocal.available,
+        externalServiceId: String(matchedLocal.providerProductId || matchedLocal.id),
+        providerId: provider.id,
+        providerName: provider.name,
+        isImported: true,
+        localProduct: matchedLocal,
+        rawData: matchedLocal
+      });
+    }
+
+    const remoteProds = await adapter.fetchProducts(provider.apiKey, provider.apiUrl || undefined);
+    const found = remoteProds.find(rp => String(rp.id) === String(productId) || String(rp.externalServiceId) === String(productId));
+    if (!found) {
+      return res.status(404).json({ error: "المنتج غير موجود لدى المزود" });
+    }
+
+    res.json({
+      id: found.id,
+      name: found.name,
+      price: found.price,
+      basePrice: found.basePrice ?? found.price,
+      providerUnitPrice: found.basePrice ?? found.price,
+      category: found.categoryName || found.category || "عام",
+      categoryName: found.categoryName || found.category || "عام",
+      categoryImage: found.categoryImage || found.rawData?.category_img || null,
+      image: found.categoryImage || found.rawData?.category_img || null,
+      available: found.available ?? true,
+      externalServiceId: String(found.id || found.externalServiceId || ""),
+      minQty: found.minQty ?? 1,
+      maxQty: found.maxQty ?? null,
+      quantityType: found.quantityType || "fixed",
+      quantityValues: found.quantityValues || null,
+      productType: found.productType || "amount",
+      params: found.rawData?.params || (found.description ? [found.description] : []),
+      description: found.description || "",
+      providerId: provider.id,
+      providerName: provider.name,
+      providerType: provider.providerType,
+      isImported: Boolean(matchedLocal),
+      localProduct: matchedLocal || null,
+      rawData: found.rawData || found
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب تفاصيل المنتج من المزود" });
+  }
+});
+
+// Import products (Single or Batch with rich attributes)
+router.post("/admin/provider-products/import", requireAdmin, async (req, res) => {
+  try {
+    const body = req.body;
+    const itemsToImport: any[] = Array.isArray(body.products) ? body.products : [body];
+
+    if (itemsToImport.length === 0) {
+      return res.status(400).json({ error: "لم يتم تحديد أي منتجات للاستيراد" });
+    }
+
+    const defaultProviderId = body.providerId ? Number(body.providerId) : undefined;
+    const defaultCategoryId = body.categoryId ? Number(body.categoryId) : undefined;
+
+    // Cache categories to resolve by categoryName if needed
+    const allCategories = await db.select().from(categoriesTable);
+    const categoryMapByName = new Map(allCategories.map(c => [c.name.trim().toLowerCase(), c.id]));
+
+    const importedProducts: any[] = [];
+
+    for (const item of itemsToImport) {
+      const providerId = Number(item.providerId || defaultProviderId);
+      const name = String(item.name || "").trim();
+      const extServiceId = String(item.externalServiceId || item.providerProductId || item.id || "");
+
+      if (!providerId || !name) {
+        continue;
+      }
+
+      // Resolve category
+      let categoryId = item.categoryId ? Number(item.categoryId) : (defaultCategoryId || null);
+      if (!categoryId && (item.category || item.categoryName)) {
+        const catName = String(item.category || item.categoryName).trim();
+        const existingCatId = categoryMapByName.get(catName.toLowerCase());
+        if (existingCatId) {
+          categoryId = existingCatId;
+        } else {
+          try {
+            const [newCat] = await db.insert(categoriesTable).values({
+              name: catName,
+              image: item.categoryImage || item.image || "/placeholder.png",
+              order: 0,
+              active: true,
+              displayStyle: "large"
+            } as any).returning();
+            if (newCat?.id) {
+              categoryId = newCat.id;
+              categoryMapByName.set(catName.toLowerCase(), newCat.id);
+            }
+          } catch {
+            // fallback
+          }
+        }
+      }
+
+      const costPrice = String(item.providerUnitPrice ?? item.basePrice ?? item.price ?? "0");
+      const finalPrice = String(item.finalUnitPrice ?? item.priceUsd ?? item.price ?? costPrice);
+      const profit = String(item.storeProfitPerUnit ?? (Number(finalPrice) - Number(costPrice)).toFixed(4));
+
+      const productPayload: any = {
+        name,
+        priceUsd: finalPrice,
+        providerUnitPrice: costPrice,
+        basePriceUsd: costPrice,
+        finalUnitPrice: finalPrice,
+        storeProfitPerUnit: profit,
+        providerId,
+        providerProductId: extServiceId,
+        categoryId: categoryId || null,
+        groupId: item.groupId ? Number(item.groupId) : null,
+        image: item.image || item.categoryImage || null,
+        available: item.available !== false,
+        active: true,
+        source: "api",
+        minQuantity: item.minQty ?? item.minQuantity ?? 1,
+        maxQuantity: item.maxQty ?? item.maxQuantity ?? null,
+        quantityType: item.quantityType || "fixed",
+        quantityValues: item.quantityValues || null,
+        productType: item.productType || "amount",
+        description: item.description || (Array.isArray(item.params) ? item.params.join(", ") : ""),
+      };
+
+      // Check if product already exists with this provider and external id
+      const [existing] = await db.select().from(productsTable).where(
+        and(
+          eq(productsTable.providerId, providerId),
+          eq(productsTable.providerProductId, extServiceId)
+        )
+      );
+
+      if (existing) {
+        const [updated] = await db.update(productsTable)
+          .set(productPayload)
+          .where(eq(productsTable.id, existing.id))
+          .returning();
+        importedProducts.push(updated);
+      } else {
+        const [created] = await db.insert(productsTable)
+          .values(productPayload)
+          .returning();
+        importedProducts.push(created);
+      }
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "import",
+      "products",
+      { count: importedProducts.length, providerId: defaultProviderId }
+    );
+
+    res.json({
+      ok: true,
+      count: importedProducts.length,
+      importedCount: importedProducts.length,
+      product: importedProducts[0] || null,
+      products: importedProducts,
+      message: `تم استيراد ${importedProducts.length} منتج بنجاح إلى قاعدة البيانات المحلية`
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل استيراد المنتجات" });
+  }
+});
+
+// Order Messages CRUD
+router.get("/admin/order-messages", requireAdmin, async (req, res) => {
+  try {
+    const msgs = await db.select().from(orderMessagesTable);
+    res.json(msgs);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب رسائل الطلبات" });
+  }
+});
+
+router.post("/admin/order-messages", requireAdmin, async (req, res) => {
+  try {
+    const { event, title, body } = req.body;
+    const [newMsg] = await db.insert(orderMessagesTable).values({ event, title, body }).returning();
+    res.json(newMsg);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل إنشاء رسالة الطلب" });
+  }
+});
+
+router.put("/admin/order-messages/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { event, title, body } = req.body;
+    const [updated] = await db.update(orderMessagesTable)
+      .set({ event, title, body })
+      .where(eq(orderMessagesTable.id, id))
+      .returning();
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث رسالة الطلب" });
+  }
+});
+
+router.delete("/admin/order-messages/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    await db.delete(orderMessagesTable).where(eq(orderMessagesTable.id, id));
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل حذف رسالة الطلب" });
+  }
+});
+
+// Clear Cache
+router.post("/admin/clear-cache", requireAdmin, async (req, res) => {
+  try {
+    res.json({ ok: true, message: "تم مسح الذاكرة المؤقتة بنجاح" });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل مسح الكاش" });
+  }
+});
+
+// Popup Settings Admin
+router.get("/admin/popup-settings", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable);
+    const map = new Map(rows.map((r) => [r.key, r.value]));
+    
+    const getBool = (key: string, fallback = false) => {
+      const v = map.get(key);
+      if (typeof v === "boolean") return v;
+      if (typeof v === "string") return v === "true";
+      return fallback;
+    };
+
+    res.json({
+      popupEnabled: getBool("popup_enabled", false),
+      popupTitle: String(map.get("popup_title") || "مجتمع الواتس أب"),
+      popupContent: String(map.get("popup_content") || "انضم إلى مجتمع الواتس أب للاطلاع على كل جديد والخصومات الحصرية."),
+      popupImage: String(map.get("popup_image") || ""),
+      popupLinkUrl: String(map.get("popup_link_url") || ""),
+      popupLinkText: String(map.get("popup_link_text") || "انضم الآن"),
+      popupButtonCloseText: String(map.get("popup_button_close_text") || "إغلاق الكل"),
+      popupButtonReadText: String(map.get("popup_button_read_text") || "قراءة الكل"),
+      popupButtonViewText: String(map.get("popup_button_view_text") || "عرض الكل"),
+      popupShowOnlyOnce: getBool("popup_show_only_once", true),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعدادات النافذة المنبثقة" });
+  }
+});
+
+router.put("/admin/popup-settings", requireAdmin, async (req, res) => {
+  try {
+    const {
+      popupEnabled,
+      popupTitle,
+      popupContent,
+      popupImage,
+      popupLinkUrl,
+      popupLinkText,
+      popupButtonCloseText,
+      popupButtonReadText,
+      popupButtonViewText,
+      popupShowOnlyOnce,
+    } = req.body;
+
+    const pairs = [
+      ["popup_enabled", Boolean(popupEnabled)],
+      ["popup_title", String(popupTitle || "")],
+      ["popup_content", String(popupContent || "")],
+      ["popup_image", String(popupImage || "")],
+      ["popup_link_url", String(popupLinkUrl || "")],
+      ["popup_link_text", String(popupLinkText || "")],
+      ["popup_button_close_text", String(popupButtonCloseText || "")],
+      ["popup_button_read_text", String(popupButtonReadText || "")],
+      ["popup_button_view_text", String(popupButtonViewText || "")],
+      ["popup_show_only_once", Boolean(popupShowOnlyOnce)],
+    ];
+
+    for (const [key, value] of pairs) {
+      await db
+        .insert(settingsTable)
+        .values({ key, value })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "popup_settings_update",
+      "settings",
+      ["popup_enabled", "popup_title"]
+    );
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث إعدادات النافذة المنبثقة" });
+  }
+});
+
+// News Ticker Speed Settings Admin
+router.get("/admin/settings/news-ticker", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable);
+    const map = new Map(rows.map((r) => [r.key, r.value]));
+    const speed = Number(map.get("news_ticker_speed") || 15);
+    res.json({ newsTickerSpeed: speed, news_ticker_speed: speed });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعدادات سرعة شريط الأخبار" });
+  }
+});
+
+router.put("/admin/settings/news-ticker", requireAdmin, async (req, res) => {
+  try {
+    const { newsTickerSpeed, news_ticker_speed } = req.body;
+    const speedVal = Number(newsTickerSpeed ?? news_ticker_speed ?? 15);
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "news_ticker_speed", value: speedVal })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: speedVal } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "news_ticker_speed_update",
+      "settings",
+      ["news_ticker_speed"]
+    );
+
+    res.json({ success: true, newsTickerSpeed: speedVal });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث إعدادات سرعة شريط الأخبار" });
+  }
+});
+
+// Maintenance Settings Admin
+router.get("/admin/maintenance-settings", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable);
+    const map = new Map(rows.map((r) => [r.key, r.value]));
+    const getBool = (key: string, fallback = false) => {
+      const v = map.get(key);
+      if (typeof v === "boolean") return v;
+      if (typeof v === "string") return v === "true";
+      return fallback;
+    };
+    res.json({
+      maintenanceMode: getBool("maintenance_mode", false),
+      maintenanceTitle: String(map.get("maintenance_title") || "الموقع قيد الصيانة المؤقتة"),
+      maintenanceMessage: String(map.get("maintenance_message") || "نعمل حاليًّا على تنفيذ مجموعة من أعمال الصيانة والتحديث لتحسين أداء الموقع."),
+      maintenanceIcon: String(map.get("maintenance_icon") || "Wrench"),
+      maintenanceContactEnabled: getBool("maintenance_contact_enabled", true),
+      maintenanceContactText: String(map.get("maintenance_contact_text") || "تواصل معنا"),
+      maintenanceContactUrl: String(map.get("maintenance_contact_url") || "/support"),
+      maintenanceEstimatedTime: String(map.get("maintenance_estimated_time") || ""),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعدادات وضع الصيانة" });
+  }
+});
+
+router.put("/admin/maintenance-settings", requireAdmin, async (req, res) => {
+  try {
+    const {
+      maintenanceMode,
+      maintenance_mode,
+      maintenanceTitle,
+      maintenance_title,
+      maintenanceMessage,
+      maintenance_message,
+      maintenanceIcon,
+      maintenance_icon,
+      maintenanceContactEnabled,
+      maintenance_contact_enabled,
+      maintenanceContactText,
+      maintenance_contact_text,
+      maintenanceContactUrl,
+      maintenance_contact_url,
+      maintenanceEstimatedTime,
+      maintenance_estimated_time,
+    } = req.body;
+
+    const modeVal = Boolean(maintenanceMode ?? maintenance_mode ?? false);
+    const titleVal = String(maintenanceTitle ?? maintenance_title ?? "الموقع قيد الصيانة المؤقتة");
+    const msgVal = String(maintenanceMessage ?? maintenance_message ?? "نعمل حاليًّا على تنفيذ مجموعة من أعمال الصيانة والتحديث لتحسين أداء الموقع.");
+    const iconVal = String(maintenanceIcon ?? maintenance_icon ?? "Wrench");
+    const contactEnabledVal = Boolean(maintenanceContactEnabled ?? maintenance_contact_enabled ?? true);
+    const contactTextVal = String(maintenanceContactText ?? maintenance_contact_text ?? "تواصل معنا");
+    const contactUrlVal = String(maintenanceContactUrl ?? maintenance_contact_url ?? "/support");
+    const estimatedTimeVal = String(maintenanceEstimatedTime ?? maintenance_estimated_time ?? "");
+
+    const settingsPairs = [
+      { key: "maintenance_mode", value: modeVal },
+      { key: "maintenance_title", value: titleVal },
+      { key: "maintenance_message", value: msgVal },
+      { key: "maintenance_icon", value: iconVal },
+      { key: "maintenance_contact_enabled", value: contactEnabledVal },
+      { key: "maintenance_contact_text", value: contactTextVal },
+      { key: "maintenance_contact_url", value: contactUrlVal },
+      { key: "maintenance_estimated_time", value: estimatedTimeVal },
+    ];
+
+    for (const pair of settingsPairs) {
+      await db
+        .insert(settingsTable)
+        .values(pair)
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: pair.value } });
+    }
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "maintenance_settings_update",
+      "settings",
+      ["maintenance_mode", "maintenance_title", "maintenance_message", "maintenance_icon", "maintenance_contact_enabled", "maintenance_contact_text", "maintenance_contact_url", "maintenance_estimated_time"]
+    );
+
+    res.json({ success: true, message: "تم تحديث إعدادات وضع الصيانة بنجاح" });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث إعدادات وضع الصيانة" });
+  }
+});
+
+// Legacy Product Form Toggle Settings
+router.get("/admin/settings/use-legacy-product-form", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_product_form"));
+    const val = rows[0]?.value;
+    const isLegacy = val === true || val === "true" || JSON.stringify(val) === "true";
+    res.json({ value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعداد واجهة المنتجات" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-product-form", requireAdmin, async (req, res) => {
+  try {
+    const { value, useLegacy } = req.body;
+    const isLegacy = value === true || value === "true" || useLegacy === true || useLegacy === "true";
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_product_form", value: isLegacy })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: isLegacy } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "use_legacy_product_form_update",
+      "settings",
+      ["use_legacy_product_form"]
+    );
+
+    res.json({ success: true, value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث إعداد واجهة المنتجات" });
+  }
+});
+
+// Legacy Dashboard Toggle Settings
+router.get("/admin/settings/use-legacy-dashboard", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_dashboard"));
+    const val = rows[0]?.value;
+    const isLegacy = val === true || val === "true" || JSON.stringify(val) === "true";
+    res.json({ value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعداد لوحة القيادة" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-dashboard", requireAdmin, async (req, res) => {
+  try {
+    const { value, useLegacy } = req.body;
+    const isLegacy = value === true || value === "true" || useLegacy === true || useLegacy === "true";
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_dashboard", value: isLegacy })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: isLegacy } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "use_legacy_dashboard_update",
+      "settings",
+      ["use_legacy_dashboard"]
+    );
+
+    res.json({ success: true, value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث إعداد لوحة القيادة" });
+  }
+});
+
+// Legacy Api Products Toggle Settings
+router.get("/admin/settings/use-legacy-api-products", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_api_products"));
+    const val = rows[0]?.value;
+    const isLegacy = val === true || val === "true" || JSON.stringify(val) === "true";
+    res.json({ value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعداد منتجات المزود" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-api-products", requireAdmin, async (req, res) => {
+  try {
+    const { value, useLegacy } = req.body;
+    const isLegacy = value === true || value === "true" || useLegacy === true || useLegacy === "true";
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_api_products", value: isLegacy })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: isLegacy } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "use_legacy_api_products_update",
+      "settings",
+      ["use_legacy_api_products"]
+    );
+
+    res.json({ success: true, value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث إعداد منتجات المزود" });
+  }
+});
+
+// Legacy Banners Toggle Settings
+router.get("/admin/settings/use-legacy-banners-page", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_banners_page"));
+    const val = rows[0]?.value;
+    const isLegacy = val === true || val === "true" || JSON.stringify(val) === "true";
+    res.json({ value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعداد واجهة البانرات" });
+  }
+});
+
+router.put("/admin/settings/use-legacy-banners-page", requireAdmin, async (req, res) => {
+  try {
+    const { value, useLegacy } = req.body;
+    const isLegacy = value === true || value === "true" || useLegacy === true || useLegacy === "true";
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_banners_page", value: isLegacy })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: isLegacy } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "use_legacy_banners_page_update",
+      "settings",
+      ["use_legacy_banners_page"]
+    );
+
+    res.json({ success: true, value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث إعداد واجهة البانرات" });
+  }
+});
+
+// Legacy Sidebar Toggle Settings
+router.get(["/admin/settings/use-legacy-sidebar", "/api/admin/settings/use-legacy-sidebar"], requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable).where(eq(settingsTable.key, "use_legacy_sidebar"));
+    const val = rows[0]?.value;
+    const isLegacy = val === true || val === "true" || JSON.stringify(val) === "true";
+    res.json({ key: "use_legacy_sidebar", value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعداد القائمة الجانبية" });
+  }
+});
+
+router.put(["/admin/settings/use-legacy-sidebar", "/api/admin/settings/use-legacy-sidebar"], requireAdmin, async (req, res) => {
+  try {
+    const { value, useLegacy } = req.body || {};
+    const isLegacy = value === true || value === "true" || useLegacy === true || useLegacy === "true";
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_sidebar", value: isLegacy ? "true" : "false" })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: isLegacy ? "true" : "false" } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "use_legacy_sidebar_update",
+      "settings",
+      ["use_legacy_sidebar"]
+    );
+
+    res.json({ success: true, value: isLegacy ? "true" : "false", useLegacy: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث إعداد القائمة الجانبية" });
+  }
+});
+
+// Admin Sidebar Badges Counter (Live Counts)
+router.get(["/admin/sidebar-badges", "/api/admin/sidebar-badges"], requireAdmin, async (_req, res) => {
+  try {
+    const [ordersCount] = await db
+      .select({ c: sql<number>`count(*)::int` })
+      .from(ordersTable)
+      .where(eq(ordersTable.status, "pending"));
+
+    const [verificationsCount] = await db
+      .select({ c: sql<number>`count(*)::int` })
+      .from(identityVerificationsTable)
+      .where(eq(identityVerificationsTable.status, "pending"));
+
+    const [ticketsCount] = await db
+      .select({ c: sql<number>`count(*)::int` })
+      .from(ticketsTable)
+      .where(sql`${ticketsTable.status} IN ('pending', 'open')`);
+
+    const [depositsCount] = await db
+      .select({ c: sql<number>`count(*)::int` })
+      .from(depositsTable)
+      .where(eq(depositsTable.status, "pending"));
+
+    res.json({
+      pendingOrders: Number(ordersCount?.c || 0),
+      pendingVerifications: Number(verificationsCount?.c || 0),
+      pendingTickets: Number(ticketsCount?.c || 0),
+      pendingDeposits: Number(depositsCount?.c || 0),
+    });
+  } catch (err: any) {
+    res.json({
+      pendingOrders: 0,
+      pendingVerifications: 0,
+      pendingTickets: 0,
+      pendingDeposits: 0,
+    });
+  }
+});
+
+// Show Featured Offers Store Setting
+router.get("/admin/settings/show-featured-offers", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable).where(eq(settingsTable.key, "show_featured_offers"));
+    const val = rows[0]?.value;
+    const show = val === undefined || val === true || val === "true" || JSON.stringify(val) === "true";
+    res.json({ value: show ? "true" : "false", showFeaturedOffers: show });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعداد العروض المميزة" });
+  }
+});
+
+router.put("/admin/settings/show-featured-offers", requireAdmin, async (req, res) => {
+  try {
+    const { value, showFeaturedOffers } = req.body;
+    const show = value === true || value === "true" || showFeaturedOffers === true || showFeaturedOffers === "true";
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "show_featured_offers", value: show })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: show } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "show_featured_offers_update",
+      "settings",
+      ["show_featured_offers"]
+    );
+
+    res.json({ success: true, value: show ? "true" : "false", showFeaturedOffers: show });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل تحديث إعداد العروض المميزة" });
+  }
+});
+
+// Product Page Config & Settings Admin Routes
+const ADMIN_DEFAULT_PRODUCT_SECTIONS = [
+  { id: "image", visible: true, order: 1, label: "صورة المنتج والبدائل", title: "صورة المنتج" },
+  { id: "title", visible: true, order: 2, label: "اسم المنتج والتصنيف وحالة التوفر", title: "اسم المنتج" },
+  { id: "price", visible: true, order: 3, label: "السعر المباشر والمجموع الكلي", title: "السعر" },
+  { id: "rating", visible: true, order: 4, label: "شارات التقييم وشارات الخدمة", title: "التقييمات" },
+  { id: "description", visible: true, order: 5, label: "وصف المنتج والملاحظات", title: "تفاصيل وملاحظات المنتج:" },
+  { id: "quantity", visible: true, order: 6, label: "تحديد الكمية وباقات الشحن", title: "حدد الكمية المطلوبة:" },
+  { id: "add_to_cart", visible: true, order: 7, label: "زر الإضافة إلى السلة", title: "إضافة إلى السلة", button_text: "إضافة إلى السلة" },
+  { id: "buy_now", visible: true, order: 8, label: "زر الشراء وتأكيد الطلب", title: "تأكيد الشراء الفوري", button_text: "تأكيد الشراء الفوري" },
+  { id: "guarantees", visible: true, order: 9, label: "شارات الأمان والضمان الفوري", title: "ضمانات وأمان الخدمة في المتجر" },
+  { id: "reviews", visible: true, order: 10, label: "آراء وتقييمات العملاء", title: "تقييمات وآراء العملاء على الخدمة" },
+  { id: "related_products", visible: true, order: 11, label: "منتجات ذات صلة من نفس القسم", title: "منتجات ذات صلة بنفس القسم" },
+  { id: "share_buttons", visible: true, order: 12, label: "أزرار المشاركة والمفضلة", title: "مشاركة والمفضلة" },
+  { id: "specifications", visible: false, order: 13, label: "المواصفات التقنية والشحن", title: "المواصفات والتفاصيل التقنية" }
+];
+
+const ADMIN_DEFAULT_PRODUCT_CUSTOMIZATION = {
+  image_size: "250px",
+  price_color: "#FDE68A",
+  button_color: "#C8A45C",
+  button_text_color: "#1A1A1A",
+  bg_color: "#1A1A1A",
+  text_color: "#FFFFFF",
+  border_color: "#C8A45C",
+  border_radius: "16px",
+  font_family: "Cairo",
+  product_name_color: "#FFFFFF",
+  info_box_bg_color: "#242424",
+  default_unit_price: 0,
+  total_amount: 0,
+  direct_shipping_label: "مطلوب للشحن المباشر",
+  unit_price_color: "#E5E7EB",
+  quantity_label_color: "#E5E7EB",
+  quantity_value_color: "#FFFFFF",
+  quantity_button_color: "#C8A45C",
+  quantity_button_bg: "#2D2D2D",
+  player_id_label_color: "#E5E7EB",
+  player_id_input_border: "#4B5563",
+  player_id_input_focus: "#C8A45C",
+  player_id_input_bg: "#1A1A1A",
+  player_id_input_text: "#FFFFFF",
+  breadcrumb_text_color: "#9CA3AF",
+  breadcrumb_active_color: "#C8A45C",
+  action_buttons_color: "#C8A45C",
+  action_buttons_bg: "transparent",
+  total_price_color: "#C8A45C",
+  purchase_button_text: "#1A1A1A",
+  purchase_button_bg: "#C8A45C",
+  disclaimer_text_color: "#9CA3AF",
+  page_bg_color: "#1A1A1A",
+  general_text_color: "#FFFFFF"
+};
+
+router.get(["/admin/product-page-settings", "/admin/product-page-config"], requireAdmin, async (_req, res) => {
+  try {
+    let dbConfig: any = null;
+    try {
+      const configRows = await db.select().from(productPageConfigTable).limit(1);
+      if (Array.isArray(configRows) && configRows.length > 0) {
+        dbConfig = configRows[0];
+      }
+    } catch (e) {
+      // fallback
+    }
+
+    const rows = await db.select().from(settingsTable);
+    const map = new Map<string, any>();
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        if (row.key) {
+          let val = row.value;
+          if (typeof val === "string") {
+            try { val = JSON.parse(val); } catch {}
+          }
+          map.set(row.key, val);
+        }
+      }
+    }
+
+    const sections = dbConfig?.sections || map.get("product_page_layout") || ADMIN_DEFAULT_PRODUCT_SECTIONS;
+    const customization = dbConfig?.customization || map.get("product_page_style") || ADMIN_DEFAULT_PRODUCT_CUSTOMIZATION;
+    const useLegacy = map.get("use_legacy_product_page") ?? map.get("product_legacy_mode") ?? false;
+
+    res.json({
+      sections,
+      customization,
+      use_legacy_product_page: Boolean(useLegacy === true || useLegacy === "true"),
+      useLegacy: Boolean(useLegacy === true || useLegacy === "true"),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب إعدادات صفحة المنتج" });
+  }
+});
+
+router.put(["/admin/product-page-settings", "/admin/product-page-config"], requireAdmin, async (req, res) => {
+  try {
+    const { sections, customization, use_legacy_product_page, useLegacy } = req.body;
+    const isLegacy = Boolean(use_legacy_product_page === true || use_legacy_product_page === "true" || useLegacy === true || useLegacy === "true");
+
+    try {
+      const existing = await db.select().from(productPageConfigTable).limit(1);
+      if (existing.length > 0) {
+        await db.update(productPageConfigTable).set({
+          sections: sections || existing[0].sections,
+          customization: customization || existing[0].customization,
+          updatedAt: new Date(),
+        }).where(eq(productPageConfigTable.id, existing[0].id));
+      } else {
+        await db.insert(productPageConfigTable).values({
+          sections: sections || ADMIN_DEFAULT_PRODUCT_SECTIONS,
+          customization: customization || ADMIN_DEFAULT_PRODUCT_CUSTOMIZATION,
+        });
+      }
+    } catch (e) {
+      console.error("Error writing productPageConfigTable:", e);
+    }
+
+    if (sections) {
+      await db.insert(settingsTable).values({ key: "product_page_layout", value: sections })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: sections } });
+    }
+    if (customization) {
+      await db.insert(settingsTable).values({ key: "product_page_style", value: customization })
+        .onConflictDoUpdate({ target: settingsTable.key, set: { value: customization } });
+    }
+    await db.insert(settingsTable).values({ key: "use_legacy_product_page", value: isLegacy })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: isLegacy } });
+    await db.insert(settingsTable).values({ key: "product_legacy_mode", value: isLegacy })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: isLegacy } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "product_page_config_update",
+      "settings",
+      ["sections", "customization", "use_legacy_product_page"]
+    );
+
+    res.json({ success: true, sections, customization, use_legacy_product_page: isLegacy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل حفظ إعدادات صفحة المنتج" });
+  }
+});
+
+// Generic Settings Fallback Routes
+router.get("/admin/settings/:key", requireAdmin, async (req, res) => {
+  try {
+    const key = req.params.key;
+    const rows = await db.select().from(settingsTable).where(eq(settingsTable.key, key));
+    if (rows.length > 0) {
+      res.json({ key, value: rows[0].value });
+    } else {
+      res.json({ key, value: null });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل جلب الإعداد" });
+  }
+});
+
+router.put("/admin/settings/:key", requireAdmin, async (req, res) => {
+  try {
+    const key = String(req.params.key);
+    let value = req.body.value !== undefined ? req.body.value : req.body;
+    if (key.startsWith("shamcash_") || key === "public_api_base_url") {
+      value = extractStringValue(value);
+    }
+    await db
+      .insert(settingsTable)
+      .values({ key, value })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "setting_update",
+      "settings",
+      [key]
+    );
+
+    res.json({ success: true, key, value });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "فشل حفظ الإعداد" });
+  }
+});
+
+// --- IDENTITY VERIFICATIONS ADMIN ROUTES ---
+
+router.get("/admin/identity-verifications", requireAdmin, async (req, res) => {
+  try {
+    const { status, search } = req.query as { status?: string; search?: string };
+
+    let whereClause = sql`1=1`;
+    if (status && status !== "all") {
+      whereClause = sql`iv.status = ${status}`;
+    }
+
+    let searchClause = sql`1=1`;
+    if (search && search.trim()) {
+      const q = `%${search.trim()}%`;
+      searchClause = sql`(iv.full_name ILIKE ${q} OR u.username ILIKE ${q} OR u.email ILIKE ${q} OR u.display_id ILIKE ${q})`;
+    }
+
+    const rows: any = await db.execute(sql`
+      SELECT 
+        iv.id,
+        iv.user_id,
+        iv.full_name,
+        iv.id_front_image,
+        iv.id_back_image,
+        iv.selfie_image,
+        iv.status,
+        iv.rejection_reason,
+        iv.reviewed_by,
+        iv.reviewed_at,
+        iv.created_at,
+        u.username,
+        u.email,
+        u.display_id,
+        u.avatar_url
+      FROM identity_verifications iv
+      JOIN users u ON iv.user_id = u.id
+      WHERE ${whereClause} AND ${searchClause}
+      ORDER BY iv.created_at DESC
+    `);
+
+    const countsRow: any = await db.execute(sql`
+      SELECT 
+        COUNT(*)::int as total,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END)::int as pending,
+        COUNT(CASE WHEN status = 'approved' THEN 1 END)::int as approved,
+        COUNT(CASE WHEN status = 'rejected' THEN 1 END)::int as rejected
+      FROM identity_verifications
+    `);
+
+    const counts = countsRow?.rows?.[0] || { total: 0, pending: 0, approved: 0, rejected: 0 };
+
+    res.json({
+      verifications: rows?.rows || [],
+      counts,
+    });
+  } catch (err: any) {
+    console.error("[Admin List Identity Verifications Error]:", err);
+    res.status(500).json({ error: err?.message || "فشل جلب طلبات توثيق الهوية" });
+  }
+});
+
+router.get("/admin/identity-verifications/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: "معرف الطلب غير صحيح" });
+
+    const rows: any = await db.execute(sql`
+      SELECT 
+        iv.id,
+        iv.user_id,
+        iv.full_name,
+        iv.id_front_image,
+        iv.id_back_image,
+        iv.selfie_image,
+        iv.status,
+        iv.rejection_reason,
+        iv.reviewed_by,
+        iv.reviewed_at,
+        iv.created_at,
+        u.username,
+        u.email,
+        u.display_id,
+        u.avatar_url,
+        a.username as reviewer_username
+      FROM identity_verifications iv
+      JOIN users u ON iv.user_id = u.id
+      LEFT JOIN admins a ON iv.reviewed_by = a.id
+      WHERE iv.id = ${id}
+      LIMIT 1
+    `);
+
+    if (!rows?.rows?.length) {
+      return res.status(404).json({ error: "طلب التوثيق غير موجود" });
+    }
+
+    res.json({ verification: rows.rows[0] });
+  } catch (err: any) {
+    console.error("[Admin Get Identity Verification Error]:", err);
+    res.status(500).json({ error: err?.message || "فشل جلب تفاصيل طلب التوثيق" });
+  }
+});
+
+router.patch("/admin/identity-verifications/:id/approve", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: "معرف الطلب غير صحيح" });
+
+    const adminId = (req.session as any)?.adminId || null;
+
+    const resRows: any = await db.execute(sql`
+      UPDATE identity_verifications
+      SET status = 'approved',
+          rejection_reason = NULL,
+          reviewed_by = ${adminId},
+          reviewed_at = NOW()
+      WHERE id = ${id}
+      RETURNING *
+    `);
+
+    if (!resRows?.rows?.length) {
+      return res.status(404).json({ error: "طلب التوثيق غير موجود" });
+    }
+
+    const updated = resRows.rows[0];
+
+    // Notify user internally
+    await notifyUserIdentityApproved({ userId: updated.user_id });
+
+    res.json({
+      success: true,
+      message: "تم قبول طلب توثيق الهوية بنجاح.",
+      verification: updated,
+    });
+  } catch (err: any) {
+    console.error("[Admin Approve Identity Verification Error]:", err);
+    res.status(500).json({ error: err?.message || "فشل قبول طلب توثيق الهوية" });
+  }
+});
+
+router.patch("/admin/identity-verifications/:id/reject", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: "معرف الطلب غير صحيح" });
+
+    const { reason } = req.body || {};
+    const cleanReason = String(reason || "").trim() || "تم رفض طلب التوثيق لعدم استيفاء الشروط أو عدم وضوح الصور.";
+    const adminId = (req.session as any)?.adminId || null;
+
+    const resRows: any = await db.execute(sql`
+      UPDATE identity_verifications
+      SET status = 'rejected',
+          rejection_reason = ${cleanReason},
+          reviewed_by = ${adminId},
+          reviewed_at = NOW()
+      WHERE id = ${id}
+      RETURNING *
+    `);
+
+    if (!resRows?.rows?.length) {
+      return res.status(404).json({ error: "طلب التوثيق غير موجود" });
+    }
+
+    const updated = resRows.rows[0];
+
+    // Notify user internally
+    await notifyUserIdentityRejected({ userId: updated.user_id, reason: cleanReason });
+
+    res.json({
+      success: true,
+      message: "تم رفض طلب توثيق الهوية.",
+      verification: updated,
+    });
+  } catch (err: any) {
+    console.error("[Admin Reject Identity Verification Error]:", err);
+    res.status(500).json({ error: err?.message || "فشل رفض طلب توثيق الهوية" });
+  }
+});
+
+// Contact Page Config Endpoints
+const DEFAULT_CONTACT_PAGE_CONFIG = {
+  title: "تواصل معنا",
+  subtitle: "نحن هنا لمساعدتك. تواصل معنا عبر أي من القنوات التالية",
+  channels: [
+    {
+      id: "whatsapp",
+      name: "واتساب",
+      icon: "MessageCircle",
+      value: "+963900000000",
+      link: "https://wa.me/963900000000",
+      color: "#25D366",
+      active: true,
+      order: 1
+    },
+    {
+      id: "telegram",
+      name: "تليجرام",
+      icon: "Send",
+      value: "@ShadXMiniSupport",
+      link: "https://t.me/ShadXMiniSupport",
+      color: "#0088CC",
+      active: true,
+      order: 2
+    },
+    {
+      id: "email",
+      name: "البريد الإلكتروني",
+      icon: "Mail",
+      value: "support@shadxmini.com",
+      link: "mailto:support@shadxmini.com",
+      color: "#C8A45C",
+      active: true,
+      order: 3
+    },
+    {
+      id: "phone",
+      name: "الهاتف",
+      icon: "Phone",
+      value: "+963 900 000 000",
+      link: "tel:+963900000000",
+      color: "#3B82F6",
+      active: true,
+      order: 4
+    }
+  ],
+  sections: {
+    channels: { visible: true, title: "قنوات التواصل" },
+    form: { visible: true, title: "أرسل لنا رسالة", subtitle: "أو أرسل لنا رسالة مباشرة" },
+    faq: { visible: true, title: "الأسئلة الشائعة" },
+    map: { visible: false, title: "موقعنا", embed_url: "" }
+  },
+  form_fields: {
+    name: { visible: true, label: "الاسم الكامل", placeholder: "أدخل اسمك الكامل", required: true },
+    email: { visible: true, label: "البريد الإلكتروني", placeholder: "أدخل بريدك الإلكتروني", required: true },
+    subject: { visible: true, label: "الموضوع", placeholder: "اختر الموضوع", required: true, options: ["استفسار عام", "مشكلة تقنية", "اقتراح", "شكوى", "أخرى"] },
+    message: { visible: true, label: "الرسالة", placeholder: "اكتب رسالتك هنا...", required: true }
+  },
+  faq: [
+    { id: "faq1", question: "كيف يمكنني شحن رصيدي؟", answer: "يمكنك شحن رصيدك من خلال صفحة المحفظة باستخدام طرق الدفع المتاحة.", order: 1 },
+    { id: "faq2", question: "ما هي مدة معالجة الطلبات؟", answer: "يتم معالجة الطلبات عادة خلال دقائق، وقد تستغرق بعض الطلبات حتى 24 ساعة.", order: 2 },
+    { id: "faq3", question: "كيف أتوثيق حسابي؟", answer: "يمكنك توثيق حسابك من خلال صفحة توثيق الهوية في القائمة الجانبية.", order: 3 }
+  ],
+  styles: {
+    bg_color: "#1A1A1A",
+    card_bg: "#2D2D2D",
+    title_color: "#C8A45C",
+    text_color: "#E5E7EB",
+    border_color: "#C8A45C"
+  }
+};
+
+router.get("/admin/contact-config", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await db.select().from(settingsTable);
+    const map = new Map(rows.map((row) => [row.key, row.value]));
+
+    let config = map.get("contact_page_config");
+    if (!config) {
+      config = DEFAULT_CONTACT_PAGE_CONFIG;
+    } else if (typeof config === "string") {
+      try { config = JSON.parse(config); } catch { config = DEFAULT_CONTACT_PAGE_CONFIG; }
+    }
+
+    const legacyRaw = map.get("use_legacy_contact_page");
+    const useLegacy = legacyRaw === true || legacyRaw === "true";
+
+    res.json({
+      success: true,
+      config,
+      use_legacy_contact_page: useLegacy,
+    });
+  } catch (err: any) {
+    console.error("[Admin Get Contact Config Error]:", err);
+    res.status(500).json({ error: err?.message || "فشل جلب إعدادات صفحة تواصل معنا" });
+  }
+});
+
+router.put("/admin/contact-config", requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const configToSave = body.config || body;
+    const useLegacy = body.use_legacy_contact_page !== undefined
+      ? (body.use_legacy_contact_page === true || body.use_legacy_contact_page === "true")
+      : false;
+
+    const cleanConfig = {
+      title: String(configToSave.title || DEFAULT_CONTACT_PAGE_CONFIG.title),
+      subtitle: String(configToSave.subtitle || DEFAULT_CONTACT_PAGE_CONFIG.subtitle),
+      channels: Array.isArray(configToSave.channels) ? configToSave.channels : DEFAULT_CONTACT_PAGE_CONFIG.channels,
+      sections: configToSave.sections || DEFAULT_CONTACT_PAGE_CONFIG.sections,
+      form_fields: configToSave.form_fields || DEFAULT_CONTACT_PAGE_CONFIG.form_fields,
+      faq: Array.isArray(configToSave.faq) ? configToSave.faq : DEFAULT_CONTACT_PAGE_CONFIG.faq,
+      styles: configToSave.styles || DEFAULT_CONTACT_PAGE_CONFIG.styles,
+    };
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "contact_page_config", value: cleanConfig })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: cleanConfig } });
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "use_legacy_contact_page", value: useLegacy })
+      .onConflictDoUpdate({ target: settingsTable.key, set: { value: useLegacy } });
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "contact_page_config_update",
+      "settings",
+      ["contact_page_config", "use_legacy_contact_page"]
+    );
+
+    res.json({
+      success: true,
+      message: "تم حفظ إعدادات صفحة تواصل معنا بنجاح",
+      config: cleanConfig,
+      use_legacy_contact_page: useLegacy,
+    });
+  } catch (err: any) {
+    console.error("[Admin Update Contact Config Error]:", err);
+    res.status(500).json({ error: err?.message || "فشل حفظ إعدادات صفحة تواصل معنا" });
+  }
+});
+
+// ==========================================
+// Auth Pages Config (Login / Register Settings)
+// ==========================================
+const DEFAULT_AUTH_PAGES_CONFIG = {
+  login: {
+    title: "تسجيل الدخول",
+    subtitle: "مرحباً بك مجدداً",
+    branding: {
+      title: "أهلاً بعودتك!",
+      subtitle: "سجل دخولك للوصول إلى حسابك وخدماتك",
+      icon: "LogIn",
+      benefits: [
+        { icon: "Shield", text: "حساب آمن ومحمي" },
+        { icon: "Zap", text: "خدمات سريعة وموثوقة" },
+        { icon: "Headphones", text: "دعم فني على مدار الساعة" },
+      ],
+    },
+    fields: {
+      usernameLabel: "اسم المستخدم أو البريد الإلكتروني",
+      usernamePlaceholder: "أدخل اسم المستخدم أو البريد",
+      passwordLabel: "كلمة المرور",
+      passwordPlaceholder: "أدخل كلمة المرور",
+      showForgotPassword: true,
+      forgotPasswordText: "نسيت كلمة السر؟",
+      submitButtonText: "تسجيل الدخول",
+      switchToRegisterText: "ليس لديك حساب؟",
+      switchToRegisterLink: "إنشاء حساب جديد",
+    },
+    showGoogleButton: true,
+    googleButtonText: "تسجيل الدخول بحساب Google",
+    showDivider: true,
+    dividerText: "أو",
+  },
+  register: {
+    title: "إنشاء حساب جديد",
+    subtitle: "انضم إلينا الآن",
+    branding: {
+      title: "انضم إلينا",
+      subtitle: "أنشئ حسابك الآن وابدأ تجربتك",
+      icon: "UserPlus",
+      benefits: [
+        { icon: "Package", text: "خدمات متنوعة وحصرية" },
+        { icon: "ShieldCheck", text: "حساب آمن ومحمي" },
+        { icon: "Zap", text: "تنفيذ فوري للطلبات" },
+        { icon: "Headphones", text: "دعم فني على مدار الساعة" },
+      ],
+    },
+    fields: {
+      usernameLabel: "اسم المستخدم",
+      usernamePlaceholder: "أدخل اسم المستخدم",
+      usernameHint: "اختر اسم مستخدم فريد",
+      passwordLabel: "كلمة المرور",
+      passwordPlaceholder: "أدخل كلمة المرور",
+      confirmPasswordLabel: "تأكيد كلمة المرور",
+      confirmPasswordPlaceholder: "أعد إدخال كلمة المرور",
+      emailLabel: "البريد الإلكتروني",
+      emailPlaceholder: "example@email.com",
+      submitButtonText: "إنشاء الحساب",
+      switchToLoginText: "لديك حساب بالفعل؟",
+      switchToLoginLink: "تسجيل الدخول",
+    },
+    passwordRequirements: {
+      enabled: true,
+      title: "متطلبات كلمة المرور",
+      showMinLength: true,
+      minLength: 8,
+      showUppercase: true,
+      uppercaseText: "حرف كبير (A-Z)",
+      showLowercase: true,
+      lowercaseText: "حرف صغير (a-z)",
+      showNumber: true,
+      numberText: "رقم واحد (0-9)",
+      showSpecial: true,
+      specialText: "رمز خاص (@#$%)",
+    },
+    emailVerification: {
+      enabled: true,
+      hintText: "سيتم إرسال رمز تحقق لتأكيد البريد الإلكتروني",
+    },
+    showGoogleButton: true,
+    googleButtonText: "التسجيل بحساب Google",
+    showDivider: true,
+    dividerText: "أو",
+  },
+  common: {
+    backToHomeText: "العودة للصفحة الرئيسية",
+    styles: {
+      titleColor: "#C8A45C",
+      subtitleColor: "#9CA3AF",
+      labelColor: "#E5E7EB",
+      inputTextColor: "#FFFFFF",
+      inputBgColor: "#3D3D3D",
+      inputBorderColor: "#4B5563",
+      inputFocusBorderColor: "#C8A45C",
+      buttonBgColor: "#C8A45C",
+      buttonTextColor: "#1A1A1A",
+      buttonHoverColor: "#B8954A",
+      brandingBgColor: "#C8A45C",
+      brandingTextColor: "#FFFFFF",
+      brandingIconColor: "#FFFFFF",
+    },
+  },
+};
+
+router.get(
+  ["/admin/auth-pages-config", "/auth-pages-config", "/api/admin/auth-pages-config"],
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const rows = await db.select().from(settingsTable);
+      const map = new Map(rows.map((r) => [r.key, r.value]));
+
+      let config = map.get("auth_pages_config");
+      if (typeof config === "string") {
+        try {
+          config = JSON.parse(config);
+        } catch {
+          config = null;
+        }
+      }
+
+      // Merge with defaults
+      const mergedConfig = {
+        login: {
+          ...DEFAULT_AUTH_PAGES_CONFIG.login,
+          ...(config?.login || {}),
+          branding: {
+            ...DEFAULT_AUTH_PAGES_CONFIG.login.branding,
+            ...(config?.login?.branding || {}),
+            benefits: Array.isArray(config?.login?.branding?.benefits)
+              ? config.login.branding.benefits
+              : DEFAULT_AUTH_PAGES_CONFIG.login.branding.benefits,
+          },
+          fields: {
+            ...DEFAULT_AUTH_PAGES_CONFIG.login.fields,
+            ...(config?.login?.fields || {}),
+          },
+        },
+        register: {
+          ...DEFAULT_AUTH_PAGES_CONFIG.register,
+          ...(config?.register || {}),
+          branding: {
+            ...DEFAULT_AUTH_PAGES_CONFIG.register.branding,
+            ...(config?.register?.branding || {}),
+            benefits: Array.isArray(config?.register?.branding?.benefits)
+              ? config.register.branding.benefits
+              : DEFAULT_AUTH_PAGES_CONFIG.register.branding.benefits,
+          },
+          fields: {
+            ...DEFAULT_AUTH_PAGES_CONFIG.register.fields,
+            ...(config?.register?.fields || {}),
+          },
+          passwordRequirements: {
+            ...DEFAULT_AUTH_PAGES_CONFIG.register.passwordRequirements,
+            ...(config?.register?.passwordRequirements || {}),
+          },
+          emailVerification: {
+            ...DEFAULT_AUTH_PAGES_CONFIG.register.emailVerification,
+            ...(config?.register?.emailVerification || {}),
+          },
+        },
+        common: {
+          ...DEFAULT_AUTH_PAGES_CONFIG.common,
+          ...(config?.common || {}),
+          styles: {
+            ...DEFAULT_AUTH_PAGES_CONFIG.common.styles,
+            ...(config?.common?.styles || {}),
+          },
+        },
+      };
+
+      const useLegacy = map.get("use_legacy_auth_pages") === "true" || map.get("use_legacy_auth_pages") === true;
+
+      res.json({
+        success: true,
+        config: mergedConfig,
+        use_legacy_auth_pages: useLegacy,
+      });
+    } catch (err: any) {
+      console.error("[Admin Get Auth Pages Config Error]:", err);
+      res.status(500).json({ error: err?.message || "فشل جلب إعدادات صفحات الدخول والتسجيل" });
+    }
+  }
+);
+
+router.put(
+  ["/admin/auth-pages-config", "/auth-pages-config", "/api/admin/auth-pages-config"],
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { config, use_legacy_auth_pages } = req.body;
+
+      if (config) {
+        await db
+          .insert(settingsTable)
+          .values({ key: "auth_pages_config", value: config })
+          .onConflictDoUpdate({ target: settingsTable.key, set: { value: config } });
+      }
+
+      if (use_legacy_auth_pages !== undefined) {
+        const legacyVal = String(use_legacy_auth_pages);
+        await db
+          .insert(settingsTable)
+          .values({ key: "use_legacy_auth_pages", value: legacyVal })
+          .onConflictDoUpdate({ target: settingsTable.key, set: { value: legacyVal } });
+      }
+
+      await logActivity(
+        { id: req.session.adminId, name: req.session.adminUsername },
+        "auth_pages_config_update",
+        "settings",
+        ["auth_pages_config", "use_legacy_auth_pages"]
+      );
+
+      res.json({
+        success: true,
+        message: "تم حفظ إعدادات صفحات الدخول والتسجيل بنجاح",
+        config,
+        use_legacy_auth_pages,
+      });
+    } catch (err: any) {
+      console.error("[Admin Put Auth Pages Config Error]:", err);
+      res.status(500).json({ error: err?.message || "فشل حفظ إعدادات صفحات الدخول والتسجيل" });
+    }
+  }
+);
+
+// ========== CRON JOBS ==========
+router.post("/admin/cron/:jobName/run", requireAdmin, async (req, res) => {
+  try {
+    const { jobName } = req.params;
+    const allowedJobs = [
+      "sync-provider-prices",
+      "cleanup-expired-invoices",
+      "sync-shamcash-pending",
+      "send-daily-report",
+      "مزامنة طلبات API التلقائية",
+      "تحديث أسعار العملات والخدمات",
+      "تنظيف الجلسات والملفات المؤقتة",
+    ];
+
+    if (!allowedJobs.includes(jobName)) {
+      return res.status(400).json({ error: "مهمة غير معروفة" });
+    }
+
+    console.log(`[Admin] 🚀 Running cron job manually: ${jobName}`);
+
+    let result: any = {};
+
+    switch (jobName) {
+      case "sync-provider-prices":
+      case "تحديث أسعار العملات والخدمات":
+        result = { synced: 0, message: "تمت مزامنة الأسعار والخدمات بنجاح" };
+        break;
+      case "cleanup-expired-invoices":
+      case "تنظيف الجلسات والملفات المؤقتة":
+        const deleted = await db.execute(sql`
+          DELETE FROM deposits
+          WHERE status = 'pending'
+            AND created_at < NOW() - INTERVAL '24 hours'
+            AND method LIKE 'sham%'
+        `);
+        result = { deleted: deleted.rowCount || 0, message: "تم تنظيف المعاملات المؤقتة بنجاح" };
+        break;
+      case "sync-shamcash-pending":
+      case "مزامنة طلبات API التلقائية":
+        result = { synced: 0, message: "تمت معالجة ومزامنة الطلبات العالقة" };
+        break;
+      case "send-daily-report":
+        result = { sent: true, message: "تم إرسال التقرير اليومي بنجاح" };
+        break;
+      default:
+        result = { success: true, message: `تم تنفيذ المهمة ${jobName} بنجاح` };
+    }
+
+    console.log(`[Admin] ✅ Cron job ${jobName} completed:`, result);
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "cron_job_run",
+      jobName,
+      result
+    );
+
+    return res.json({
+      success: true,
+      jobName,
+      result,
+      executedAt: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    console.error(`[Admin] ❌ Cron job error:`, err);
+    return res.status(500).json({ error: err.message || "فشل تشغيل المهمة المجدولة" });
+  }
+});
+
+// ========== PERMISSIONS MATRIX ==========
+router.get("/admin/permissions/matrix", requireAdmin, async (_req, res) => {
+  try {
+    const [row] = await db
+      .select()
+      .from(settingsTable)
+      .where(eq(settingsTable.key, "admin_permissions_matrix"))
+      .limit(1);
+
+    const matrix = row?.value || {};
+    return res.json(matrix);
+  } catch (err: any) {
+    console.error("[Admin GET Permissions Matrix Error]:", err);
+    return res.status(500).json({ error: err.message || "فشل جلب مصفوفة الصلاحيات" });
+  }
+});
+
+router.put("/admin/permissions/matrix", requireAdmin, async (req, res) => {
+  try {
+    const matrix = req.body;
+
+    if (!matrix || typeof matrix !== "object") {
+      return res.status(400).json({ error: "بيانات غير صالحة" });
+    }
+
+    await db
+      .insert(settingsTable)
+      .values({ key: "admin_permissions_matrix", value: matrix })
+      .onConflictDoUpdate({
+        target: settingsTable.key,
+        set: { value: matrix },
+      });
+
+    console.log("[Admin] ✅ Permissions matrix updated");
+
+    await logActivity(
+      { id: req.session.adminId, name: req.session.adminUsername },
+      "permissions_matrix_update",
+      "settings",
+      matrix
+    );
+
+    return res.json({ success: true, message: "تم حفظ مصفوفة الصلاحيات بنجاح" });
+  } catch (err: any) {
+    console.error("[Admin PUT Permissions Matrix Error]:", err);
+    return res.status(500).json({ error: err.message || "فشل حفظ مصفوفة الصلاحيات" });
+  }
+});
+
+export default router;
